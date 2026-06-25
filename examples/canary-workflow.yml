@@ -1,0 +1,24 @@
+# Canary caller — ONE low-stakes service rides @main to vet ci-templates changes
+# before the v1 tag is moved. Same as caller-workflow.yml but pinned @main.
+name: deploy-canary
+on:
+  push:
+    branches: [main]
+
+jobs:
+  ship:
+    uses: zj1123581321/ci-templates/.github/workflows/build-deploy.yml@main
+    with:
+      image_name: canary-svc
+      host: 100.64.0.1          # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-1)
+      ssh_user: deploy
+      deploy_dir: /srv/automation/canary-svc
+      healthcheck_url: http://localhost:9999/healthz
+      ci_templates_ref: main      # fetch deploy scripts from main too
+    secrets:
+      ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+      SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+      KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}             # runner joins tailnet to reach the internal host
+      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # read-only PAT to checkout private ci-templates scripts

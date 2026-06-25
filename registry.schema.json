@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zj1123581321/ci-templates/registry.schema.json",
+  "title": "Fleet service registry",
+  "description": "Single source of truth for the 50+ service fleet (host->service map). Consumed by D3 CI, D4 template, D5 observability, D7 tiering. Stores ONLY secret references, never plaintext DSNs.",
+  "type": "object",
+  "required": ["services"],
+  "additionalProperties": false,
+  "properties": {
+    "services": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/service" }
+    }
+  },
+  "$defs": {
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "git_url",
+        "default_branch",
+        "host",
+        "deploy_dir",
+        "port",
+        "glitchtip_project",
+        "sentry_dsn_secret",
+        "tier",
+        "rollback_safety"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "description": "Unique service id (kebab-case). Also the ACR image name."
+        },
+        "git_url": {
+          "type": "string",
+          "pattern": "^https?://|^git@",
+          "description": "Source repository URL."
+        },
+        "default_branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SSH alias (~/.ssh/config) of the deploy target host."
+        },
+        "deploy_dir": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path on the host. (host, deploy_dir) must be unique."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Published host port. Must be unique across the fleet."
+        },
+        "glitchtip_project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sentry_dsn_secret": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "description": "Name of the secret/env var holding the DSN (e.g. SENTRY_DSN_FOO). NEVER the DSN itself."
+        },
+        "monitor_slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "description": "cron services only (optional): GlitchTip cron monitor slug, unique across the fleet. Long-running services use Uptime Kuma liveness probes instead and omit this."
+        },
+        "heartbeat_url_secret": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "description": "cron services only: NAME of the secret/env var holding the GlitchTip Heartbeat check-in URL (e.g. ZLX_HEARTBEAT_URL_FOO). NEVER the URL itself. Injected at runtime via ZLX_HEARTBEAT_URL. GlitchTip 6.2 cron dead-man's-switch requires Heartbeat, not capture_checkin."
+        },
+        "tier": {
+          "enum": ["dev", "staging", "prod"],
+          "description": "Environment / blast-radius tier (D7). staging only for services with real blast radius."
+        },
+        "rollback_safety": {
+          "enum": ["safe", "unsafe", "conditional"],
+          "description": "Whether redeploying the previous image tag is safe. unsafe = irreversible side-effects (e.g. forward-only DB migration)."
+        },
+        "healthcheck_url": {
+          "type": "string",
+          "description": "Optional post-deploy health probe URL (overrides default). Used by pull_and_deploy.sh rollback gate."
+        }
+      }
+    }
+  }
+}

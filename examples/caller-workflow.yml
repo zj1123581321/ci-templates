@@ -1,0 +1,25 @@
+# Drop this into a service repo at .github/workflows/deploy.yml.
+# Pin @v1 (NOT @main) — a stable major tag, so one bad ci-templates commit
+# can't fan out to all 50 deploys. The canary repo is the only one on @main.
+name: deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  ship:
+    uses: zj1123581321/ci-templates/.github/workflows/build-deploy.yml@v1
+    with:
+      image_name: web-api                       # == registry service id == ACR image
+      host: 100.64.0.1                                # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-1)
+      ssh_user: deploy                                     # SSH user on the target host
+      deploy_dir: /srv/automation/web-api
+      healthcheck_url: http://localhost:8001/healthz    # probe gate (auto-rollback on fail)
+      ci_templates_ref: v1                              # fetch deploy scripts from @v1 too
+    secrets:                                            # explicit — no `inherit`
+      ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+      SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+      KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}             # runner joins tailnet to reach the internal host
+      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # read-only PAT to checkout private ci-templates scripts

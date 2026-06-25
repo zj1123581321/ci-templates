@@ -1,0 +1,24 @@
+# ci-templates self-CI: validate the registry + run the deploy-logic tests.
+# This is what makes "missing field / duplicate slug / plaintext DSN" fail fast
+# at PR time instead of silently breaking a production deploy.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install pytest pyyaml jsonschema
+      - name: Validate registry.yaml
+        run: python scripts/validate_registry.py registry.yaml
+      - name: Run tests
+        run: python -m pytest -q

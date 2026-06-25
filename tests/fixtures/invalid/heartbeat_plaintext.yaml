@@ -1,0 +1,15 @@
+# heartbeat_url_secret holds a real check-in URL instead of a secret reference
+# name -> must fail fast (same "store the reference, not the value" rule as DSN)
+services:
+  - id: web-api
+    git_url: https://github.com/example-org/web-api
+    default_branch: main
+    host: host-1
+    deploy_dir: /srv/automation/web-api
+    port: 8001
+    glitchtip_project: web-api
+    sentry_dsn_secret: SENTRY_DSN_OPS_DISPATCHER
+    monitor_slug: web-api-cron
+    heartbeat_url_secret: https://glitchtip.example.com/api/0/organizations/acme/heartbeat_check/abc123/
+    tier: prod
+    rollback_safety: safe

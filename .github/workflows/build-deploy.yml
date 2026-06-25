@@ -1,0 +1,207 @@
+# Reusable build + deploy pipeline for the 50+ service舰队 (D3).
+#
+# Callers pin @v1 (NOT @main). A canary repo rides @main; once green we move the
+# v1 tag, so a single bad commit can't fan out to all 50 deploys at once.
+#
+# SECURITY (A4 / codex#5): secrets are declared EXPLICITLY — no `secrets: inherit`.
+# This workflow can only ever see the 6 secrets below, nothing else in the org.
+name: build-deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "ACR image name == registry service id"
+        required: true
+        type: string
+      host:
+        description: "Tailscale-reachable address (IP or MagicDNS name) of the deploy target; also the concurrency key. NOT a ~/.ssh/config alias (runner has no config)."
+        required: true
+        type: string
+      ssh_user:
+        description: "SSH user on the deploy target host"
+        required: false
+        default: "zlx"
+        type: string
+      deploy_dir:
+        description: "Absolute path on the host holding the compose file"
+        required: true
+        type: string
+      acr_registry:
+        description: "ACR registry host"
+        required: false
+        default: "crpi-0vsre5argteykh9m.cn-guangzhou.personal.cr.aliyuncs.com"
+        type: string
+      acr_namespace:
+        description: "ACR namespace"
+        required: false
+        default: "zlx-personal"
+        type: string
+      build_context:
+        required: false
+        default: "."
+        type: string
+      dockerfile:
+        required: false
+        default: "Dockerfile"
+        type: string
+      healthcheck_url:
+        description: "Post-deploy health probe URL; empty disables the gate"
+        required: false
+        default: ""
+        type: string
+      healthcheck_expect_status:
+        required: false
+        default: "200"
+        type: string
+      healthcheck_retries:
+        required: false
+        default: "5"
+        type: string
+      healthcheck_interval:
+        required: false
+        default: "3"
+        type: string
+      healthcheck_warmup:
+        required: false
+        default: "10"
+        type: string
+      ci_templates_ref:
+        description: "Ref of ci-templates to fetch the deploy scripts from"
+        required: false
+        default: "v1"
+        type: string
+    # EXPLICIT secrets only — least privilege. Do NOT add `inherit`.
+    secrets:
+      ACR_USERNAME:
+        required: true
+      ACR_PASSWORD:
+        required: true
+      SSH_DEPLOY_KEY:
+        required: true
+      KNOWN_HOSTS:
+        required: true
+      TS_AUTHKEY:
+        required: true
+      CI_TEMPLATES_PAT:
+        required: true
+
+# Per-host concurrency: GitHub-side serialization, paired with SSH flock on the
+# host. A new deploy to the same host waits rather than racing.
+concurrency:
+  group: deploy-${{ inputs.host }}
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Checkout ci-templates (deploy scripts)
+        # ci-templates 是 private 仓,默认 GITHUB_TOKEN 读不了 → 用只读 PAT
+        uses: actions/checkout@v4
+        with:
+          repository: zj1123581321/ci-templates
+          ref: ${{ inputs.ci_templates_ref }}
+          token: ${{ secrets.CI_TEMPLATES_PAT }}
+          path: .ci-templates
+
+      - name: Resolve git SHA (immutable tag)
+        id: sha
+        run: echo "git_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ACR
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
+            "${{ inputs.acr_registry }}" \
+            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Build & push immutable image
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          GIT_SHA: ${{ steps.sha.outputs.git_sha }}
+          BUILD_CONTEXT: ${{ inputs.build_context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: bash .ci-templates/scripts/push_to_acr.sh
+
+      - name: Connect to Tailscale
+        # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy over SSH (flock + health probe + auto-rollback)
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          GIT_SHA: ${{ steps.sha.outputs.git_sha }}
+          DEPLOY_HOST: ${{ inputs.host }}
+          SSH_USER: ${{ inputs.ssh_user }}
+          DEPLOY_DIR: ${{ inputs.deploy_dir }}
+          HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
+          HEALTHCHECK_EXPECT_STATUS: ${{ inputs.healthcheck_expect_status }}
+          HEALTHCHECK_RETRIES: ${{ inputs.healthcheck_retries }}
+          HEALTHCHECK_INTERVAL: ${{ inputs.healthcheck_interval }}
+          HEALTHCHECK_WARMUP: ${{ inputs.healthcheck_warmup }}
+        run: |
+          ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
+          # keepalive 防 tailnet 上偶发的 `Connection reset ...:22`(canary 遇过,50 服务规模会常遇):
+          # 15s 探一次,连丢 4 次(~60s)才判死;连接阶段也给 ConnectTimeout 兜底。
+          SSH_OPTS="-i $HOME/.ssh/id_deploy \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=20"
+
+          # 退出码语义(决定能不能重试):
+          #   0   = 部署健康
+          #   255 = SSH/scp 传输层失败(Connection reset / timeout)→ 瞬时,安全重试
+          #   1   = pull_and_deploy.sh 主动失败(探针挂,且已在 host 端自动回滚)
+          #         → 真实坏部署,绝不重试(否则重拉/重部/重滚 3 遍,搅乱生产)
+          # scp 只是拷个脚本文件(无副作用),失败一律归到 255 当瞬时重试;
+          # ssh 透传远端脚本的退出码,1 与 255 在此被区分对待。
+          deploy_once() {
+            scp $SSH_OPTS .ci-templates/scripts/pull_and_deploy.sh \
+              "${SSH_USER}@${DEPLOY_HOST}:/tmp/pull_and_deploy.sh" || return 255
+            ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+              "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
+               GIT_SHA='${GIT_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' \
+               HOST_LOCK='/var/lock/fleet-deploy.lock' \
+               HEALTHCHECK_URL='${HEALTHCHECK_URL}' \
+               HEALTHCHECK_EXPECT_STATUS='${HEALTHCHECK_EXPECT_STATUS}' \
+               HEALTHCHECK_RETRIES='${HEALTHCHECK_RETRIES}' \
+               HEALTHCHECK_INTERVAL='${HEALTHCHECK_INTERVAL}' \
+               HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
+               bash /tmp/pull_and_deploy.sh"
+          }
+
+          attempt=1; max_attempts=3
+          while true; do
+            rc=0; deploy_once || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "::notice::deploy ok (attempt ${attempt}/${max_attempts})"
+              break
+            fi
+            if [ "$rc" -ne 255 ]; then
+              # 脚本主动失败(已回滚)—— 真实问题,立即上报,不重试
+              echo "::error::deploy failed (rc=${rc}); host 已按探针门自动回滚,不重试"
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::SSH transport failed after ${max_attempts} attempts (rc=255)"
+              exit 1
+            fi
+            echo "::warning::SSH transport hiccup (rc=255) attempt ${attempt}/${max_attempts}, retrying in 10s"
+            attempt=$((attempt + 1))
+            sleep 10
+          done

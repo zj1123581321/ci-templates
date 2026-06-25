@@ -1,0 +1,14 @@
+# sentry_dsn_secret holds a real DSN URL instead of a secret reference name
+# -> must fail fast so a DSN never lands in the registry in plaintext
+services:
+  - id: web-api
+    git_url: https://github.com/example-org/web-api
+    default_branch: main
+    host: host-1
+    deploy_dir: /srv/automation/web-api
+    port: 8001
+    glitchtip_project: web-api
+    sentry_dsn_secret: https://abc123def456@glitchtip.example.com/42
+    monitor_slug: web-api-cron
+    tier: prod
+    rollback_safety: safe

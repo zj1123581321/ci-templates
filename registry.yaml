@@ -1,0 +1,41 @@
+# Fleet service registry — single source of truth for a self-hosted fleet.
+# Validated in CI by registry.schema.json + scripts/validate_registry.py.
+#
+# NOTE: This is a synthetic example. Replace it with your own fleet's services.
+#
+# Rules (enforced by the validator, fail fast):
+#   - id / port / monitor_slug / (host, deploy_dir) unique across the fleet
+#   - sentry_dsn_secret / heartbeat_url_secret store a secret *name*, never a
+#     plaintext value (a value containing :// fails validation)
+#   - tier ∈ {dev, staging, prod}; rollback_safety ∈ {safe, unsafe, conditional}
+#   - monitor_slug / heartbeat_url_secret only for cron services; long-running
+#     services use an external uptime probe instead
+#
+# host = an SSH alias in ~/.ssh/config. Retire a host -> edit here.
+services:
+  # ── a long-running async service (no cron; external uptime probe) ──
+  - id: web-api
+    git_url: https://github.com/example-org/web-api
+    default_branch: main
+    host: host-1
+    deploy_dir: /srv/web-api
+    port: 8333
+    glitchtip_project: web-api
+    sentry_dsn_secret: SENTRY_DSN_WEB_API
+    tier: dev
+    rollback_safety: safe
+    healthcheck_url: http://localhost:8333/api/v1/health
+
+  # ── a scheduled worker (cron; emits a dead-man heartbeat) ──
+  - id: digest-worker
+    git_url: https://github.com/example-org/digest-worker
+    default_branch: main
+    host: host-1
+    deploy_dir: /srv/digest-worker
+    port: 8080
+    glitchtip_project: digest-worker
+    sentry_dsn_secret: SENTRY_DSN_DIGEST_WORKER
+    monitor_slug: digest-worker-cron
+    heartbeat_url_secret: HEARTBEAT_URL_DIGEST_WORKER
+    tier: prod
+    rollback_safety: safe

@@ -1,0 +1,24 @@
+# both services deploy to the same (host, deploy_dir) -> path collision on host
+services:
+  - id: web-api
+    git_url: https://github.com/example-org/web-api
+    default_branch: main
+    host: host-1
+    deploy_dir: /srv/shared/app
+    port: 8001
+    glitchtip_project: web-api
+    sentry_dsn_secret: SENTRY_DSN_OPS_DISPATCHER
+    monitor_slug: web-api-cron
+    tier: prod
+    rollback_safety: safe
+  - id: digest-worker
+    git_url: https://github.com/example-org/digest-worker
+    default_branch: main
+    host: host-1
+    deploy_dir: /srv/shared/app
+    port: 8080
+    glitchtip_project: digest-worker
+    sentry_dsn_secret: SENTRY_DSN_KEY_PROXY
+    monitor_slug: digest-worker-cron
+    tier: prod
+    rollback_safety: safe
