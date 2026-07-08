@@ -205,3 +205,59 @@ jobs:
             attempt=$((attempt + 1))
             sleep 10
           done
+
+      # ── 通知层(Phase 1 / Approach A)──────────────────────────────────────────
+      # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
+      # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
+      # fail-open(if:failure + continue-on-error + 吞异常):通知挂了绝不影响部署/回滚结论。
+      # 凭据 = 调用方(zlxlabs 服务仓)的 org 变量 vars.FEISHU_CI_WEBHOOK(关键词模式,无 secret)。
+      - name: Feishu 部署失败卡 (P0, fail-open)
+        if: failure()
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          SVC:     ${{ inputs.image_name }}
+          HOST:    ${{ inputs.host }}
+          REPO:    ${{ github.repository }}
+          SHA:     ${{ steps.sha.outputs.git_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          svc     = os.environ.get("SVC", "") or "?"
+          host    = os.environ.get("HOST", "") or "?"
+          repo    = os.environ["REPO"]
+          sha     = os.environ.get("SHA", "") or "?"
+          run_url = os.environ["RUN_URL"]
+          # 关键词模式:正文含 "zlxlabs"(repo 路径天然含)。<at id=all> 让 P0 唤醒本群。
+          body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
+                  f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
+                  f"部署失败(build / ACR / SSH / 探针 其一)。若为探针失败,host 端已按探针门"
+                  f"**自动回滚到 last_good**,生产不受影响;否则本次未上线。点按钮看详情。\n"
+                  f"<at id=all></at>")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"template": "red",
+                             "title": {"tag": "plain_text", "content": f"🔴 P0 部署失败 · {svc}"}},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
+                           "type": "primary", "url": run_url},
+                      ]},
+                  ],
+              },
+          }
+          req = urllib.request.Request(
+              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+          except Exception as e:
+              print("feishu notify failed (swallowed):", e)
+          PY
