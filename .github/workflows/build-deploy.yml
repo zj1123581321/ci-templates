@@ -232,7 +232,8 @@ jobs:
           repo    = os.environ["REPO"]
           sha     = os.environ.get("SHA", "") or "?"
           run_url = os.environ["RUN_URL"]
-          # 关键词模式:正文含 "zlxlabs"(repo 路径天然含)。<at id=all> 让 P0 唤醒本群。
+          # 关键词模式:机器人关键词 "zlxlabs" 由标题固定前缀 [zlxlabs·CI] 保证命中,与 repo 路径
+          # 解耦(2026-07-08 canary 抓到:非 zlxlabs 仓靠 repo 路径会静默丢卡 code:19024)。<at id=all> 唤醒本群。
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
                   f"部署失败(build / ACR / SSH / 探针 其一)。若为探针失败,host 端已按探针门"
@@ -243,7 +244,7 @@ jobs:
               "card": {
                   "config": {"wide_screen_mode": True},
                   "header": {"template": "red",
-                             "title": {"tag": "plain_text", "content": f"🔴 P0 部署失败 · {svc}"}},
+                             "title": {"tag": "plain_text", "content": f"🔴 [zlxlabs·CI] P0 部署失败 · {svc}"}},
                   "elements": [
                       {"tag": "div", "text": {"tag": "lark_md", "content": body}},
                       {"tag": "action", "actions": [
