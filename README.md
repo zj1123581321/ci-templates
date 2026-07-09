@@ -13,6 +13,7 @@
 ```
 .github/workflows/
   build-deploy.yml      # 复用流水线 (workflow_call)，每服务 ~10 行调它
+  gate.yml              # 复用 pre-merge 门禁 (workflow_call)：lint/jscpd/dep-cruiser/test/codex review
   ci.yml                # 本仓自测：registry 校验 + pytest
 scripts/
   push_to_acr.sh        # build + 打 git-SHA 不可变 tag + push ACR
@@ -58,6 +59,26 @@ jobs:
 
 这两个变量通常由 `zlxlabs/gate-hub` 的 `scripts/onboard-repo.sh` 按 `registry.yaml`
 里的 `notify_category` 写入，避免个人 / fordeal / 合伙人项目的 CI 卡混到同一群。
+
+## 门禁 gate.yml（pre-merge，与 build-deploy 分属两条 lane）
+
+`gate.yml` 是全部仓库共用的 **PR 门禁**（lint / jscpd 查重 / dependency-cruiser /
+tests / Codex review），原先放在私有 `zlxlabs/gate-hub`，2026-07-09 迁到本公开仓 ——
+GitHub 硬限制公开仓不能 `uses:` 私有仓的 reusable workflow，而本文件只有通用逻辑、
+没有秘密（codex review 的 prompt/策略在 self-hosted runner 本地磁盘，仓库清单与
+runner 基建在私有 gate-hub）。caller 模板与批量接入脚本仍在 `zlxlabs/gate-hub`。
+
+与 build-deploy 的关键差异：**caller 引用 `@main` 不钉 `@v1`** —— 门禁是
+"改一处、全仓库立刻生效"的集中治理（gate-hub 的核心设计），且坏 commit 只会让
+CI 变红，不会像 deploy 那样把坏版本推上生产，爆炸半径完全不同。
+
+安全模型（公开仓）：
+- **fork-PR 防护写死在 gate.yml 本体**（PR 作者改不了 @main 的这份）：fork PR 一律
+  降级 GitHub-hosted 一次性沙箱并跳过 codex review；只有本仓分支的 PR 才上 self-hosted。
+  契约由 `tests/test_gate_contract.py` 钉死。
+- 第二道闸在 org runner group：`restricted_to_workflows` 白名单只放行本文件 `@main`。
+- 公开仓的失败通知 webhook 走 repo **secret** `FEISHU_CI_WEBHOOK`（fork run 拿不到
+  secrets）；私有仓沿用 repo **variable** 兜底。
 
 ## 锁死的核心契约（来自 plan-eng-review）
 
@@ -109,6 +130,7 @@ python -m pytest -q
 - `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚不提升坏 tag（docker/curl mock，无需真实守护进程）。
 - `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency。
 - `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、caller 钉 `@v1` / canary 钉 `@main`。
+- `test_gate_contract.py` —— gate.yml 的 fork-PR 防护三处齐全（gate.runs-on / codex if / notify.runs-on）、secrets 显式且 FEISHU 可选、webhook secret 优先 vars 兜底。
 
 ## 端到端 / canary（需真实凭证与主机，未在本机执行）
 
