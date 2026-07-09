@@ -52,6 +52,13 @@ jobs:
 > `host` 自 D3 激活起是 **Tailscale 可达地址**（IP/MagicDNS），不再是 `~/.ssh/config` 别名 ——
 > GitHub runner 上没有用户的 ssh config，临时入 tailnet 后只能按 IP 连。别名 `host-1` 仍用于 registry 与人读。
 
+部署失败通知读取调用方 repo variables:
+- `FEISHU_CI_WEBHOOK`: 目标飞书自定义机器人 webhook。
+- `FEISHU_CI_TITLE_PREFIX`: 机器人关键词标题前缀；未配置时默认 `[zlxlabs·CI]`。
+
+这两个变量通常由 `zlxlabs/gate-hub` 的 `scripts/onboard-repo.sh` 按 `registry.yaml`
+里的 `notify_category` 写入，避免个人 / fordeal / 合伙人项目的 CI 卡混到同一群。
+
 ## 锁死的核心契约（来自 plan-eng-review）
 
 | # | 契约 | 落点 |

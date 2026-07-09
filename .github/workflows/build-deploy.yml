@@ -210,12 +210,14 @@ jobs:
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
       # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
       # fail-open(if:failure + continue-on-error + 吞异常):通知挂了绝不影响部署/回滚结论。
-      # 凭据 = 调用方(zlxlabs 服务仓)的 org 变量 vars.FEISHU_CI_WEBHOOK(关键词模式,无 secret)。
+      # 凭据 = 调用方服务仓的 repo 变量 vars.FEISHU_CI_WEBHOOK(关键词模式,无 secret);
+      # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
         if: failure()
         continue-on-error: true
         env:
           FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
           REPO:    ${{ github.repository }}
@@ -227,13 +229,14 @@ jobs:
           hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
           if not hook:
               print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
           repo    = os.environ["REPO"]
           sha     = os.environ.get("SHA", "") or "?"
           run_url = os.environ["RUN_URL"]
-          # 关键词模式:机器人关键词 "zlxlabs" 由标题固定前缀 [zlxlabs·CI] 保证命中,与 repo 路径
-          # 解耦(2026-07-08 canary 抓到:非 zlxlabs 仓靠 repo 路径会静默丢卡 code:19024)。<at id=all> 唤醒本群。
+          # 关键词模式:机器人关键词由标题前缀保证命中,与 repo 路径解耦
+          # (2026-07-08 canary 抓到:非 zlxlabs 仓靠 repo 路径会静默丢卡 code:19024)。<at id=all> 唤醒本群。
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
                   f"部署失败(build / ACR / SSH / 探针 其一)。若为探针失败,host 端已按探针门"
@@ -244,7 +247,7 @@ jobs:
               "card": {
                   "config": {"wide_screen_mode": True},
                   "header": {"template": "red",
-                             "title": {"tag": "plain_text", "content": f"🔴 [zlxlabs·CI] P0 部署失败 · {svc}"}},
+                             "title": {"tag": "plain_text", "content": f"🔴 {title_prefix} P0 部署失败 · {svc}"}},
                   "elements": [
                       {"tag": "div", "text": {"tag": "lark_md", "content": body}},
                       {"tag": "action", "actions": [

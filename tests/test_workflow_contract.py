@@ -70,3 +70,12 @@ def test_per_host_concurrency_group():
     assert concurrency.get("cancel-in-progress") is False, (
         "must not cancel an in-flight deploy mid-rollout"
     )
+
+
+def test_deploy_notify_title_prefix_is_repo_variable_with_default():
+    text = WORKFLOW.read_text()
+
+    assert "FEISHU_TITLE_PREFIX" in text
+    assert "vars.FEISHU_CI_TITLE_PREFIX" in text
+    assert "[zlxlabs·CI]" in text
+    assert "f\"🔴 {title_prefix} P0 部署失败" in text
