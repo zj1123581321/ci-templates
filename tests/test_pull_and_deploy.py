@@ -186,3 +186,61 @@ def test_concurrent_same_host_deploys_serialize(tmp_path):
     events = [ln.strip() for ln in event_log.read_text().splitlines() if ln.strip()]
     # serialized critical sections => enter/exit are never interleaved
     assert events == ["enter:A", "exit:A", "enter:B", "exit:B"], events
+
+
+def _mock_docker_flaky_pull(log_path: Path, fail_pulls: int, image_local: bool) -> str:
+    """docker mock: first `fail_pulls` pull calls fail; `image inspect` mirrors local presence."""
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  count_file="{log_path}.pullcount"
+  n=$(cat "$count_file" 2>/dev/null || echo 0)
+  n=$((n+1)); echo "$n" > "$count_file"
+  [ "$n" -le {fail_pulls} ] && exit 1
+  exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  exit {0 if image_local else 1}
+fi
+exit 0
+"""
+
+
+def _flaky_env(tmp_path, *, fail_pulls: int, image_local: bool) -> dict:
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    _write_exec(mock_dir / "docker",
+                _mock_docker_flaky_pull(Path(env["DOCKER_LOG"]), fail_pulls, image_local))
+    env["PULL_RETRY_DELAY"] = "0"
+    return env
+
+
+def test_pull_flake_retries_then_succeeds(tmp_path):
+    """registry 抖 2 次、第 3 次成功 → 部署照常绿。"""
+    env = _flaky_env(tmp_path, fail_pulls=2, image_local=False)
+    res = _run(env)
+    assert res.returncode == 0, res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull ") == 3, log
+    assert "compose up -d" in log
+
+
+def test_pull_exhausted_but_local_image_proceeds(tmp_path):
+    """registry 全程不可达,但 SHA 镜像已在本地(预热/回滚残留)→ 放行部署。"""
+    env = _flaky_env(tmp_path, fail_pulls=99, image_local=True)
+    res = _run(env)
+    assert res.returncode == 0, res.stderr
+    assert "already local" in res.stdout
+    assert "compose up -d" in Path(env["DOCKER_LOG"]).read_text()
+
+
+def test_pull_exhausted_and_no_local_image_fails(tmp_path):
+    """registry 不可达且本地也没镜像 → 该失败还是失败,不能拿旧 latest 蒙混。"""
+    env = _flaky_env(tmp_path, fail_pulls=99, image_local=False)
+    res = _run(env)
+    assert res.returncode != 0
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert "compose up -d" not in log, "must not compose up without the image"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    assert not good.exists()

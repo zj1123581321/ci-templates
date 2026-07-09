@@ -24,6 +24,9 @@ HOST_LOCK="${HOST_LOCK:-/var/lock/fleet-deploy.lock}"   # ONE lock per host
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 CURL_BIN="${CURL_BIN:-curl}"
 
+PULL_RETRIES="${PULL_RETRIES:-3}"
+PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"  # base seconds; backoff = delay * attempt
+
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 HEALTHCHECK_EXPECT_STATUS="${HEALTHCHECK_EXPECT_STATUS:-200}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
@@ -40,12 +43,31 @@ GOOD_TAG_FILE="${STATE_DIR}/last_good_tag"
 log()   { echo "[deploy] $*"; }
 event() { [ -n "$DEPLOY_EVENT_LOG" ] && echo "$1:${DEPLOY_ID}" >> "$DEPLOY_EVENT_LOG" || true; }
 
+# --- pull with retry + local fallback ----------------------------------------
+# 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
+# 不可变,本地已有的同 tag 镜像(回滚残留/预热)与远端逐字节一致 —— registry 单独挂
+# 不应该拦下部署(2026-07-09 n305→ACR 间歇抖,imflow 因此 9 连败)。
+pull_image() {
+  local ref="$1" attempt=1
+  while [ "$attempt" -le "$PULL_RETRIES" ]; do
+    if "$DOCKER_BIN" pull "$ref"; then return 0; fi
+    log "pull attempt ${attempt}/${PULL_RETRIES} failed for ${ref}"
+    [ "$attempt" -lt "$PULL_RETRIES" ] && sleep $((PULL_RETRY_DELAY * attempt))
+    attempt=$((attempt + 1))
+  done
+  if "$DOCKER_BIN" image inspect "$ref" >/dev/null 2>&1; then
+    log "registry unreachable but ${ref} already local — proceeding"
+    return 0
+  fi
+  log "pull failed ${PULL_RETRIES}x and ${ref} not local — aborting"
+  return 1
+}
+
 # --- deploy a specific tag: pull (if remote) + retag + compose up ------------
 deploy_tag() {
   local tag="$1"
   log "deploying ${ACR_IMAGE}:${tag}"
-  # the SHA image may already be local (rollback); pull is best-effort idempotent
-  "$DOCKER_BIN" pull "${ACR_IMAGE}:${tag}"
+  pull_image "${ACR_IMAGE}:${tag}"
   "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest"
   ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d )
 }
