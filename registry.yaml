@@ -2,6 +2,8 @@
 # Validated in CI by registry.schema.json + scripts/validate_registry.py.
 #
 # NOTE: This is a synthetic example. Replace it with your own fleet's services.
+#       (维护者注 2026-07-10:真实舰队台账在私有运维仓留底,本文件永远只是示例,
+#        不承载任何真实部署事实。)
 #
 # Rules (enforced by the validator, fail fast):
 #   - id / port / monitor_slug / (host, deploy_dir) unique across the fleet
