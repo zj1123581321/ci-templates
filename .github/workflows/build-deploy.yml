@@ -86,6 +86,11 @@ on:
       CI_TEMPLATES_PAT:
         required: true
 
+# Callers cannot gain more privilege through this reusable workflow. The job
+# only needs repository contents to check out the caller repository.
+permissions:
+  contents: read
+
 # Per-host concurrency: GitHub-side serialization, paired with SSH flock on the
 # host. A new deploy to the same host waits rather than racing.
 concurrency:
@@ -97,11 +102,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout caller repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Checkout ci-templates (deploy scripts)
         # ci-templates 是 private 仓,默认 GITHUB_TOKEN 读不了 → 用只读 PAT
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: zj1123581321/ci-templates
           ref: ${{ inputs.ci_templates_ref }}
@@ -130,7 +135,7 @@ jobs:
 
       - name: Connect to Tailscale
         # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机
-        uses: tailscale/github-action@v2
+        uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
 

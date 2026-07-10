@@ -17,6 +17,11 @@ EXPECTED_SECRETS = {
     "CI_TEMPLATES_PAT",    # 只读 PAT,checkout private ci-templates 的部署脚本
 }
 
+PINNED_ACTIONS = {
+    "actions/checkout": "34e114876b0b11c390a56381ad16ebd13914f8d5",
+    "tailscale/github-action": "4e4c49acaa9818630ce0bd7a564372c17e33fb4d",
+}
+
 
 def _load():
     # PyYAML parses the `on:` key as boolean True — load and normalise.
@@ -28,6 +33,15 @@ def _load():
 def test_workflow_is_workflow_call():
     _, trigger = _load()
     assert "workflow_call" in trigger, "must be a reusable workflow"
+
+
+def test_workflow_uses_least_privilege_and_immutable_action_references():
+    raw, _ = _load()
+    assert raw.get("permissions") == {"contents": "read"}
+
+    text = WORKFLOW.read_text()
+    for action, sha in PINNED_ACTIONS.items():
+        assert f"uses: {action}@{sha}" in text, f"{action} must be pinned to its full commit SHA"
 
 
 def test_secrets_declared_explicitly_not_inherited():

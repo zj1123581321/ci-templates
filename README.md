@@ -135,3 +135,11 @@ python -m pytest -q
 - caller **必须钉 `@v1`**（主版本 tag），不钉 `@main`。
 - 只有 canary 仓吃 `@main`。验证通过后移动 `v1` tag 推平舰队。
 - 一个坏 commit 进 `@main` 只炸 canary 一个，不会一次炸 50 个部署。
+
+### 发布 `v1`（单人维护版）
+
+1. 合并修复到 `main`；让唯一 canary 服务继续引用 `@main`，推一次低风险变更。
+2. 在 Actions 确认 build、ACR、SSH、健康探针和回滚门均通过。
+3. `git tag -f v1 main && git push -f origin v1`；记录发布 SHA。引用 `@v1` 的服务在下次部署自动采用该版本。
+
+不要为单个服务的紧急修复移动 `v1`；该服务可临时钉具体 commit，待 canary 验证后再统一发布。
