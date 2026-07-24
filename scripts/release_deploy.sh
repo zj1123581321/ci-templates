@@ -4,7 +4,7 @@
 # The CI job validates JSON and sends this script a restricted, tab-separated
 # manifest.  This host-side code intentionally has no jq/Python dependency.
 # Every image is pulled and retagged with D3_RELEASE_TAG before one compose up;
-# no mutable registry :latest tag is ever used.  The previous manifest and SHA
+# no mutable registry latest tag is ever used.  The previous manifest and SHA
 # are promoted only after all probes pass, and rollback uses one compose up for
 # the complete previous group.
 set -u -o pipefail
