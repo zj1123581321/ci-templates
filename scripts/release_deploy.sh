@@ -62,12 +62,12 @@ cleanup() {
   local rc=$?
   rm -f -- "${STAGING_PREFIX}.manifest" "${STAGING_PREFIX}.env" "${STAGING_PREFIX}.sha" "${STAGING_PREFIX}.release" "${STAGING_PREFIX}.previous" 2>/dev/null || true
   # These are exact per-run paths supplied by the workflow; never glob /tmp.
-  case "$REMOTE_SCRIPT_PATH" in
-    /tmp/d3-release-[0-9]*-[0-9]*.sh) rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true ;;
-  esac
-  case "$REMOTE_MANIFEST_PATH" in
-    /tmp/d3-release-[0-9]*-[0-9]*.manifest) rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true ;;
-  esac
+  if [[ "$REMOTE_SCRIPT_PATH" =~ ^/tmp/d3-release-[0-9]+-[0-9]+\.sh$ ]]; then
+    rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true
+  fi
+  if [[ "$REMOTE_MANIFEST_PATH" =~ ^/tmp/d3-release-[0-9]+-[0-9]+\.manifest$ ]]; then
+    rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true
+  fi
   if [[ -n "${LOCK_HELD:-}" ]]; then
     flock -u 9 2>/dev/null || true
   fi
