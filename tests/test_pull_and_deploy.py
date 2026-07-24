@@ -244,3 +244,128 @@ def test_pull_exhausted_and_no_local_image_fails(tmp_path):
     assert "compose up -d" not in log, "must not compose up without the image"
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     assert not good.exists()
+
+
+# --- busy-lock deploy gate (opt-in) -------------------------------------------
+# 服务侧对一个文件持共享锁(LOCK_SH)表示"有不可打断任务在跑";部署脚本替换容器前
+# 申请排他锁(LOCK_EX),拿不到就等,超时(BUSY_LOCK_TIMEOUT)就放弃(rc=3, deferred)。
+# BUSY_LOCK_FILE 为空(默认)= 关闭该门禁,行为必须与现状逐字节不变。
+
+def test_busy_lock_optout_leaves_behavior_unchanged(tmp_path):
+    """不传 BUSY_LOCK_FILE(或为空)→ 现状不变:不多一次 pull,不多开 fd。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    # 只有 deploy_tag() 里那一次 pull;门禁的预拉不应该发生(因为门禁没开)
+    assert log.count("pull ") == 1, log
+
+
+def test_busy_lock_free_deploys_normally(tmp_path):
+    """忙锁文件存在但空闲(无人持共享锁)→ 排他锁秒到,正常部署。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert "compose up -d" in log
+
+
+def test_busy_lock_held_defers_untouched(tmp_path):
+    """忙锁被服务侧共享锁占住,超预算仍未空闲 → rc=3,容器/last_good 完全不动。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    env["BUSY_LOCK_TIMEOUT"] = "1"
+
+    holder = subprocess.Popen(["flock", "-s", str(lock_file), "sleep", "5"])
+    try:
+        time.sleep(0.5)  # ensure the holder has actually grabbed the shared lock
+        res = _run(env)
+        assert res.returncode == 3, res.stdout + res.stderr
+        log = Path(env["DOCKER_LOG"]).read_text()
+        assert "compose up" not in log, log
+        assert "tag " not in log, log
+        good = Path(env["STATE_DIR"]) / "last_good_tag"
+        assert not good.exists()
+        assert "DEFERRED" in res.stdout
+    finally:
+        holder.terminate()
+        holder.wait()
+
+
+def test_busy_lock_released_within_budget_deploys(tmp_path):
+    """忙锁在等待预算内被释放 → 正常拿到排他锁并完成部署。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    env["BUSY_LOCK_TIMEOUT"] = "15"
+
+    holder = subprocess.Popen(["flock", "-s", str(lock_file), "sleep", "2"])
+    try:
+        time.sleep(0.5)
+        res = _run(env)
+        assert res.returncode == 0, res.stdout + res.stderr
+    finally:
+        holder.terminate()
+        holder.wait()
+
+
+def test_busy_lock_missing_file_warns_and_proceeds(tmp_path):
+    """锁文件(及其父目录)都不存在 → 创建 + 打显著 WARN,但不阻止部署(误配不 fail-closed)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["BUSY_LOCK_FILE"] = str(tmp_path / "nope" / "busy.lock")
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "WARN" in res.stdout
+
+
+def _mock_docker_admission_probe(log_path: Path) -> str:
+    """docker mock:在 `compose` 调用当下,用宿主 flock 非阻塞探一次 BUSY_LOCK_FILE 的共享锁。
+
+    这直接证明部署脚本在 compose up 期间确实握着 LOCK_EX —— 容器侧此刻申请
+    LOCK_SH 必然失败(admission 已关闭),没有 TOCTOU 窗口。
+    """
+    return f"""#!/bin/bash
+if [ "$1" = "compose" ]; then
+  if flock -n -s "$BUSY_LOCK_FILE" true; then
+    echo "sh_probe=open" >> "{log_path}"
+  else
+    echo "sh_probe=closed" >> "{log_path}"
+  fi
+  exit 0
+fi
+echo "$@" >> "{log_path}"
+exit 0
+"""
+
+
+def test_admission_closed_during_replace(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    _write_exec(mock_dir / "docker", _mock_docker_admission_probe(Path(env["DOCKER_LOG"])))
+
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    env["BUSY_LOCK_TIMEOUT"] = "15"
+
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert "sh_probe=closed" in log, log

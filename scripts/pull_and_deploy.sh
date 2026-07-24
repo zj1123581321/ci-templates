@@ -7,6 +7,10 @@
 #   - last-good tracking  : records the last healthy tag for rollback
 #   - health probe gate   : warmup + retries + expected status
 #   - auto rollback       : probe failure -> redeploy previous good tag
+#   - busy-lock gate      : opt-in (BUSY_LOCK_FILE); exit codes: 0=healthy,
+#                           1=probe failed (rolled back), 3=deferred (service
+#                           busy, busy lock not acquired in time, old
+#                           container untouched)
 #
 # All inputs come from the environment so the build-deploy.yml job can export
 # them and so tests can inject mocks (DOCKER_BIN / CURL_BIN).
@@ -23,6 +27,9 @@ STATE_DIR="${STATE_DIR:-${DEPLOY_DIR}/.deploy-state}"
 HOST_LOCK="${HOST_LOCK:-/var/lock/fleet-deploy.lock}"   # ONE lock per host
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 CURL_BIN="${CURL_BIN:-curl}"
+
+BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"        # opt-in deploy gate; empty = off
+BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 
 PULL_RETRIES="${PULL_RETRIES:-3}"
 PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"  # base seconds; backoff = delay * attempt
@@ -123,10 +130,36 @@ do_deploy() {
   return 1
 }
 
+# --- busy-lock deploy gate (opt-in; BUSY_LOCK_FILE empty = skip entirely) ----
+# 服务侧每个不可打断任务存续期间对这个文件持共享锁(LOCK_SH);这里在替换容器前
+# 申请排他锁(LOCK_EX) —— 拿到即证明"无进行中任务,且新任务进不来"。
+# 锁序固定:先忙锁(fd 8,服务级) 后 HOST_LOCK(fd 9,整机级)。不会死锁:每个服务
+# 的忙锁文件互不相同,HOST_LOCK 全局只有一把,顺序固定的两级锁不构成环。
+if [ -n "$BUSY_LOCK_FILE" ]; then
+  # pre-pull outside all locks: shrinks the admission-closed window to seconds
+  pull_image "${ACR_IMAGE}:${GIT_SHA}"
+  if [ ! -e "$BUSY_LOCK_FILE" ]; then
+    log "WARN: busy lock file ${BUSY_LOCK_FILE} missing — service side may not hold locks yet; creating it, proceeding WITHOUT drain protection"
+    mkdir -p "$(dirname "$BUSY_LOCK_FILE")"
+  fi
+  exec 8>>"$BUSY_LOCK_FILE"   # append-open：绝不 truncate，锁在 inode 上
+  if ! flock -w "$BUSY_LOCK_TIMEOUT" -x 8; then
+    log "service busy: busy lock not acquired within ${BUSY_LOCK_TIMEOUT}s — DEFERRED, old container kept"
+    exit 3
+  fi
+  log "busy lock acquired (admission closed until replace completes)"
+fi
+
 mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
 exec 9>"$HOST_LOCK"
 flock 9          # blocks until this host's deploy lock is free
 do_deploy
 rc=$?
 flock -u 9
+# fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于
+# fd 9 释放,才能保证 admission 在 compose up + 探针 + 回滚全程都是关闭的。
+# 这里选择显式 flock -u 8(而不是依赖脚本 exit 时内核自动释放两把锁):两者都
+# 安全(内核保证进程退出必然释放所有 flock),但显式释放让代码里的锁生命周期
+# 一目了然,也让"9 先于 8 释放"的顺序不依赖读者去脑补 exit 的隐式行为。
+[ -n "$BUSY_LOCK_FILE" ] && flock -u 8
 exit $rc
