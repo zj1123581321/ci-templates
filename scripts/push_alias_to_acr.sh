@@ -38,4 +38,3 @@ while :; do
   attempt=$((attempt + 1))
   sleep "$PUSH_RETRY_DELAY_SECONDS"
 done
-
