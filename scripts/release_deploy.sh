@@ -39,6 +39,7 @@ LOCK_FD=9
 STAGING_PREFIX="$STATE_DIR/.release-${D3_RELEASE_TAG}-$$"
 PENDING_SIGNAL=""
 ROLLBACK_MODE=0
+CURRENT_STAGED=0
 
 [[ "$D3_RELEASE_TAG" =~ ^[0-9a-f]{12}$ ]] || {
   echo "[release] D3_RELEASE_TAG must be a 12-character lowercase git SHA" >&2
@@ -64,10 +65,10 @@ cleanup() {
   local rc=$?
   rm -f -- "${STAGING_PREFIX}.manifest" "${STAGING_PREFIX}.env" "${STAGING_PREFIX}.sha" "${STAGING_PREFIX}.release" "${STAGING_PREFIX}.previous" 2>/dev/null || true
   # These are exact per-run paths supplied by the workflow; never glob /tmp.
-  if [[ "$REMOTE_SCRIPT_PATH" =~ ^/tmp/d3-release-[0-9]+-[0-9]+\.sh$ ]]; then
+  if [[ "$REMOTE_SCRIPT_PATH" =~ ^/tmp/d3-release-[0-9]+-[0-9]+-[0-9]+\.sh$ ]]; then
     rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true
   fi
-  if [[ "$REMOTE_MANIFEST_PATH" =~ ^/tmp/d3-release-[0-9]+-[0-9]+\.manifest$ ]]; then
+  if [[ "$REMOTE_MANIFEST_PATH" =~ ^/tmp/d3-release-[0-9]+-[0-9]+-[0-9]+\.manifest$ ]]; then
     rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true
   fi
   if [[ -n "${LOCK_HELD:-}" ]]; then
@@ -158,10 +159,15 @@ load_manifest() {
 }
 
 pull_and_retag() {
-  local tag="$1" i ref local_ref attempt
+  local tag="$1" prefer_local="${2:-0}" i ref local_ref attempt
   for ((i = 0; i < ${#IMAGE_NAMES[@]}; i++)); do
     ref="${IMAGE_REFS[$i]}:${tag}"
     local_ref="${IMAGE_NAMES[$i]}:${tag}"
+    if [[ "$prefer_local" -eq 1 ]] && "$DOCKER_BIN" image inspect "$ref" >/dev/null 2>&1; then
+      "$DOCKER_BIN" tag "$ref" "$local_ref" || return 1
+      check_pending || return 130
+      continue
+    fi
     attempt=1
     while (( attempt <= PULL_RETRIES )); do
       if "$DOCKER_BIN" pull "$ref"; then break; fi
@@ -201,7 +207,7 @@ compose_release() {
   fi
   compose_args+=(--env-file "$ENV_FILE")
   local rendered_images config_rc=0 image_ref found line
-  rendered_images="$("$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
+  rendered_images="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
   if (( config_rc != 0 )); then
     log "compose config --images failed; compose up will not run" >&2
     return 1
@@ -263,11 +269,22 @@ promote() {
 }
 
 deploy_group() {
-  local sha="$1" manifest="$2"
+  local sha="$1" manifest="$2" staged="${3:-0}" prefer_local="${4:-0}"
   load_manifest "$manifest" || return 1
   check_pending || return 130
-  pull_and_retag "$sha" || return 1
+  if [[ "$staged" -eq 0 ]]; then
+    pull_and_retag "$sha" "$prefer_local" || return 1
+  fi
   compose_release "$sha" || return 1
+}
+
+stage_current_release() {
+  check_pending || return 130
+  load_manifest "$RELEASE_MANIFEST" || return 1
+  check_pending || return 130
+  pull_and_retag "$D3_RELEASE_TAG" 0 || return 1
+  check_pending || return 130
+  CURRENT_STAGED=1
 }
 
 do_release() {
@@ -296,7 +313,7 @@ do_release() {
     [[ "$previous_sha" =~ ^[0-9a-f]{12}$ ]] || previous_sha=""
   fi
 
-  deploy_group "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" || current_rc=$?
+  deploy_group "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" "$CURRENT_STAGED" || current_rc=$?
   if (( current_rc != 0 )) || [[ -n "$PENDING_SIGNAL" ]]; then
     log "new release failed before health gate"
   else
@@ -318,7 +335,7 @@ do_release() {
     # transition or leave the host on a half-staged release.
     ROLLBACK_MODE=1
     trap ':' INT TERM
-    deploy_group "$previous_sha" "$previous_manifest" || rollback_rc=$?
+    deploy_group "$previous_sha" "$previous_manifest" 0 1 || rollback_rc=$?
     if (( rollback_rc == 0 )); then
       if probe_release; then
         log "rollback to ${previous_sha} healthy"
@@ -338,6 +355,7 @@ do_release() {
 
 mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
 exec 9>"$HOST_LOCK"
+stage_current_release || exit $?
 if [[ -n "$BUSY_LOCK_FILE" ]]; then
   if ! is_positive_integer "$BUSY_LOCK_TIMEOUT"; then
     log "BUSY_LOCK_TIMEOUT must be a positive integer, got: ${BUSY_LOCK_TIMEOUT}" >&2

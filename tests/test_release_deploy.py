@@ -149,6 +149,49 @@ exit 0
     assert "compose --env-file" in log.read_text()
 
 
+def test_compose_config_and_up_run_from_deploy_dir(tmp_path):
+    env, log = base(tmp_path)
+    cwd_log = tmp_path / "cwd.log"
+    env["CWD_LOG"] = str(cwd_log)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ]; then printf '%s\\n' "$PWD" >> "{cwd_log}"; fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+fi
+exit 0
+''',
+    )
+    result = run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert cwd_log.read_text().splitlines() == [env["DEPLOY_DIR"], env["DEPLOY_DIR"]]
+
+
+def test_remote_cleanup_deletes_only_exact_three_segment_paths(tmp_path):
+    env, _ = base(tmp_path)
+    nonce = f"{os.getpid()}-1-7"
+    remote_script = Path("/tmp") / f"d3-release-{nonce}.sh"
+    remote_manifest = Path("/tmp") / f"d3-release-{nonce}.manifest"
+    nonmatching = Path("/tmp") / f"d3-release-{os.getpid()}-1.sh"
+    remote_script.write_text("temporary")
+    remote_manifest.write_text(Path(env["RELEASE_MANIFEST"]).read_text())
+    nonmatching.write_text("keep")
+    env.update(
+        RELEASE_MANIFEST=str(remote_manifest),
+        RELEASE_TEMP_SCRIPT=str(remote_script),
+        BUSY_LOCK_FILE=str(tmp_path / "busy.lock"),
+        BUSY_LOCK_TIMEOUT="invalid",
+    )
+    result = run(env)
+    assert result.returncode == 1
+    assert not remote_script.exists()
+    assert not remote_manifest.exists()
+    assert nonmatching.exists()
+    nonmatching.unlink()
+
+
 def test_probe_failure_rolls_back_entire_group_and_preserves_good(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0
@@ -318,7 +361,40 @@ def test_busy_shared_service_lock_defers_before_compose(tmp_path):
     result = run(env)
     holder.wait(timeout=3)
     assert result.returncode == 3
-    assert not log.exists() or "compose" not in log.read_text()
+    assert log.read_text().count("pull ") == 2
+    assert "compose" not in log.read_text()
+    assert not (Path(env["DEPLOY_DIR"]) / ".d3-release.env").exists()
+    assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_busy_lock_release_does_not_repeat_staged_pulls(tmp_path):
+    env, log = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+    holder = _lock_holder(busy, seconds="0.2")
+    time.sleep(0.05)
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="2")
+    result = run(env)
+    holder.wait(timeout=3)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().count("pull ") == 2
+
+
+def test_term_while_busy_lock_waiting_does_not_switch_release(tmp_path):
+    env, log = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+    holder = _lock_holder(busy, seconds="2")
+    time.sleep(0.05)
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="2")
+    started = time.time()
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.2)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=4)
+    holder.wait(timeout=3)
+    assert proc.returncode != 0, stdout + stderr
+    assert time.time() - started < 4
+    assert "compose" not in log.read_text()
+    assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
 
 
 def test_rollback_pull_failure_preserves_atomic_previous_release(tmp_path):
