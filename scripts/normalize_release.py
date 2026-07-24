@@ -103,6 +103,8 @@ def _validate_probe(raw: object, index: int) -> tuple[str, str]:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValidationError(f"probe {index}.url must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValidationError(f"probe {index}.url must not contain userinfo")
     try:
         if parsed.port is not None and not 1 <= parsed.port <= 65535:
             raise ValidationError(f"probe {index}.url has an invalid port")

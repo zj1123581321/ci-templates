@@ -97,10 +97,14 @@ jobs:
             --builds-out "$RUNNER_TEMP/d3-release.builds"
 
       - name: Log in to ACR
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
-            "${{ inputs.acr_registry }}" \
-            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+          set -euo pipefail
+          printf '%s\n' "$ACR_PASSWORD" | docker login \
+            "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
 
       - name: Build and push each unique image artifact
         env:
@@ -130,12 +134,15 @@ jobs:
           authkey: ${{ secrets.TS_AUTHKEY }}
 
       - name: Set up SSH
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_DEPLOY_KEY" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
-          echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy release atomically over SSH
