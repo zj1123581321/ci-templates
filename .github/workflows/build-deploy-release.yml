@@ -1,0 +1,188 @@
+# Reusable D3 release lane for services that publish a group of compose images.
+# This is intentionally separate from build-deploy.yml: single-image callers
+# keep their existing inputs, secrets and behavior unchanged.
+name: build-deploy-release
+
+on:
+  workflow_call:
+    inputs:
+      images_json:
+        description: "Strict JSON array: image_name, build_context, dockerfile, optional build_alias"
+        required: true
+        type: string
+      probes_json:
+        description: "Strict JSON array of release-level {url, expect_status} probes"
+        required: false
+        default: "[]"
+        type: string
+      host:
+        description: "Tailscale-reachable IP or MagicDNS name; also the concurrency key"
+        required: true
+        type: string
+      ssh_user:
+        description: "SSH user on the deploy target host"
+        required: false
+        default: "zlx"
+        type: string
+      deploy_dir:
+        description: "Absolute path on the host holding the compose file"
+        required: true
+        type: string
+      acr_registry:
+        description: "ACR registry host"
+        required: false
+        default: "crpi-0vsre5argteykh9m.cn-guangzhou.personal.cr.aliyuncs.com"
+        type: string
+      acr_namespace:
+        description: "ACR namespace"
+        required: false
+        default: "zlx-personal"
+        type: string
+      ci_templates_ref:
+        description: "Ref of ci-templates to fetch the release scripts from"
+        required: false
+        default: "v1"
+        type: string
+    # Deliberately the same six explicit secrets as build-deploy.yml.
+    secrets:
+      ACR_USERNAME:
+        required: true
+      ACR_PASSWORD:
+        required: true
+      SSH_DEPLOY_KEY:
+        required: true
+      KNOWN_HOSTS:
+        required: true
+      TS_AUTHKEY:
+        required: true
+      CI_TEMPLATES_PAT:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.host }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Checkout ci-templates (release scripts)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: zj1123581321/ci-templates
+          ref: ${{ inputs.ci_templates_ref }}
+          token: ${{ secrets.CI_TEMPLATES_PAT }}
+          path: .ci-templates
+
+      - name: Resolve immutable release SHA
+        id: sha
+        run: echo "git_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate and normalize release declaration
+        env:
+          IMAGES_JSON: ${{ inputs.images_json }}
+          PROBES_JSON: ${{ inputs.probes_json }}
+        run: |
+          set -euo pipefail
+          python3 .ci-templates/scripts/normalize_release.py \
+            --images-json "$IMAGES_JSON" \
+            --probes-json "$PROBES_JSON" \
+            --manifest-out "$RUNNER_TEMP/d3-release.manifest" \
+            --builds-out "$RUNNER_TEMP/d3-release.builds"
+
+      - name: Log in to ACR
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
+            "${{ inputs.acr_registry }}" \
+            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Build and push each unique image artifact
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          GIT_SHA: ${{ steps.sha.outputs.git_sha }}
+          DOCKER_BIN: docker
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r kind build_alias build_context dockerfile canonical publish_names; do
+            [[ "$kind" == "build" ]] || continue
+            IMAGE_NAME="$canonical" BUILD_CONTEXT="$build_context" DOCKERFILE="$dockerfile" \
+              bash .ci-templates/scripts/push_to_acr.sh
+            IFS=',' read -ra names <<< "$publish_names"
+            for image_name in "${names[@]:1}"; do
+              [[ -n "$image_name" ]] || continue
+              source="${ACR_REGISTRY}/${ACR_NAMESPACE}/${canonical}:${GIT_SHA}"
+              target="${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${GIT_SHA}"
+              docker tag "$source" "$target"
+              timeout --kill-after=15s 300s docker push "$target"
+            done
+          done < "$RUNNER_TEMP/d3-release.builds"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Set up SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy release atomically over SSH
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          D3_RELEASE_TAG: ${{ steps.sha.outputs.git_sha }}
+          DEPLOY_HOST: ${{ inputs.host }}
+          SSH_USER: ${{ inputs.ssh_user }}
+          DEPLOY_DIR: ${{ inputs.deploy_dir }}
+          HOST_LOCK: /var/lock/fleet-deploy.lock
+        run: |
+          set -euo pipefail
+          SSH_OPTS=( -i "$HOME/.ssh/id_deploy" -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 -o ConnectTimeout=20 )
+          remote_manifest=/tmp/d3-release.manifest
+          remote_script=/tmp/release_deploy.sh
+          deploy_once() {
+            scp "${SSH_OPTS[@]}" .ci-templates/scripts/release_deploy.sh \
+              "$RUNNER_TEMP/d3-release.manifest" \
+              "${SSH_USER}@${DEPLOY_HOST}:/tmp/" || return 255
+            # printf %q makes every input one shell word; no JSON or raw input
+            # is ever concatenated into the remote command.
+            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q RELEASE_MANIFEST=%q bash %q' \
+              "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$DEPLOY_DIR" \
+              "$HOST_LOCK" "$remote_manifest" "$remote_script"
+            ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
+          }
+          attempt=1; max_attempts=3
+          while true; do
+            rc=0; deploy_once || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+              echo "::notice::atomic release deploy ok (attempt ${attempt}/${max_attempts})"
+              break
+            fi
+            # Only SSH/scp transport rc=255 is transient.  A release or probe
+            # failure has already rolled back (or reported first-deploy failure)
+            # and must not be replayed.
+            if [[ "$rc" -ne 255 ]]; then
+              echo "::error::release deploy failed (rc=${rc}); no transport retry"
+              exit "$rc"
+            fi
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "::error::SSH transport failed after ${max_attempts} attempts"
+              exit 1
+            fi
+            echo "::warning::SSH transport hiccup (rc=255), retrying in 10s"
+            attempt=$((attempt + 1))
+            sleep 10
+          done

@@ -13,6 +13,7 @@
 ```
 .github/workflows/
   build-deploy.yml      # 复用流水线 (workflow_call)，每服务 ~10 行调它
+  build-deploy-release.yml # 多镜像原子发布（独立接口，不改变单镜像 lane）
   ci.yml                # 本仓自测：registry 校验 + pytest
 scripts/
   push_to_acr.sh        # build + 打 git-SHA 不可变 tag + push ACR
@@ -25,6 +26,25 @@ examples/
   canary-workflow.yml   # canary 服务模板（钉 @main）
 tests/                  # pytest（schema + 部署逻辑 + workflow 契约）
 ```
+
+## 多镜像原子发布（release lane）
+
+需要让 frontend、backend 等镜像一起切换的服务调用
+`build-deploy-release.yml`。`images_json` 是严格 JSON 数组，每项至少包含
+`image_name`、`build_context`、`dockerfile`；可选 `build_alias` 让 worker 别名共享一次
+构建（同一 alias 的 context 和 Dockerfile 必须一致）。未知字段、重复 image 名、控制字符、
+绝对路径和 `..` 路径都会在构建前拒绝。`probes_json` 是严格 JSON 数组，例如：
+
+```json
+[{"url":"http://localhost:8080/","expect_status":200},
+ {"url":"http://localhost:8000/healthz","expect_status":200}]
+```
+
+构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本会在同一个 host `flock` 临界区内拉取并
+将每张镜像 retag 为 `<image_name>:<sha>`，写入统一的 `D3_RELEASE_TAG` compose 环境文件，
+然后只执行一次 `docker compose up -d`。全部探针通过后才原子提升
+`.deploy-state/release/last_good_{sha,manifest}`；失败时按旧 manifest 整组回滚，首次发布
+没有旧版本则明确失败，不会伪造 last-good。
 
 ## 调用方（每服务 ~10 行）
 
