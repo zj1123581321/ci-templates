@@ -212,9 +212,15 @@ do_release() {
         printf '%s\n' "$line" >> "$previous_manifest" || return 1
       fi
     done < "$GOOD_RELEASE_FILE"
+    if [[ ! "$previous_sha" =~ ^[0-9a-f]{12}$ ]]; then
+      log "ignoring malformed previous release SHA" >&2
+      previous_sha=""
+      previous_manifest=""
+    fi
   elif [[ -f "$GOOD_SHA_FILE" && -f "$GOOD_MANIFEST_FILE" ]]; then
     previous_sha="$(<"$GOOD_SHA_FILE")"
     previous_manifest="$GOOD_MANIFEST_FILE"
+    [[ "$previous_sha" =~ ^[0-9a-f]{12}$ ]] || previous_sha=""
   fi
 
   deploy_group "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" || current_rc=$?
