@@ -156,6 +156,40 @@ def test_remote_script_path_is_unique_per_run():
     assert ":/tmp/pull_and_deploy.sh" not in text, "fixed remote path must not reappear — it's the bug this test guards against"
 
 
+def test_rc3_rechecks_remote_state_after_prior_transport_failure():
+    # code review round 5 (P1): a 255 (SSH transport failure) can happen AFTER the
+    # remote deploy already finished (compose up + probe passed + last_good_tag
+    # written) but before the exit code made it back over the wire. A retry then
+    # sees rc=3 (busy lock held by the just-started new container) and — without
+    # this recheck — would misreport "deferred: old container kept", which is the
+    # opposite of what actually happened. The workflow must track whether a 255
+    # occurred earlier in this run, and if so, verify via the host's
+    # last_good_tag before trusting rc=3's "deferred" story.
+    text = WORKFLOW.read_text()
+
+    assert "had_transport_failure" in text, (
+        "must track whether an earlier attempt in this run hit rc=255, so a later "
+        "rc=3 can be recognised as potentially stale rather than trusted at face value"
+    )
+    assert "last_good_tag" in text, (
+        "rc=3 recheck must consult the host's last_good_tag to see whether an "
+        "earlier (transport-failed) attempt actually already deployed GIT_SHA"
+    )
+
+    # had_transport_failure must be initialised before the loop, set on the 255
+    # branch, and consulted inside the rc=3 branch — not just present anywhere.
+    idx_init = text.index("had_transport_failure=0")
+    idx_rc3 = text.index('"$rc" -eq 3')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    idx_set = text.index("had_transport_failure=1")
+    assert idx_init < idx_rc3, "had_transport_failure must be initialised before the loop"
+    # the flag is set once rc is known to be 255, i.e. after the "!= 255" guard
+    assert idx_rc_ne_255 < idx_set, "had_transport_failure=1 must be set on the confirmed-255 path"
+
+    # regression guard: deferred=true must still exist as the fallback outcome.
+    assert "deferred=true" in text, "rc=3 must still be able to fall through to deferred when the recheck doesn't confirm success"
+
+
 def test_red_card_step_skips_when_deferred():
     text = WORKFLOW.read_text()
     assert "deferred != 'true'" in text

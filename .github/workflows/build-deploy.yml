@@ -212,7 +212,7 @@ jobs:
                bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
-          attempt=1; max_attempts=3
+          attempt=1; max_attempts=3; had_transport_failure=0
           while true; do
             rc=0; deploy_once || rc=$?
             if [ "$rc" -eq 0 ]; then
@@ -223,6 +223,20 @@ jobs:
               # deferred:busy-lock 门禁(opt-in)超时未等到,服务忙,旧容器保留。
               # 顺序很重要:必须先于下面 "!= 255" 的判断拦截,否则会被误判为
               # "已按探针门自动回滚" 报错退出,语义就错了(那是给探针失败用的)。
+              if [ "$had_transport_failure" = "1" ]; then
+                # 之前出过 255:那一次远端可能已完成部署,只是退出码没传回来。rc=3 只
+                # 说明"现在拿不到锁",不能证明"旧容器还在"。用远端 last_good_tag(部署
+                # 脚本探针通过后才写入的既有状态,不新增任何机制)复核真实状态再分类。
+                # STATE_DIR 默认是 ${DEPLOY_DIR}/.deploy-state(pull_and_deploy.sh 里的
+                # 既有约定,这里直接拼接路径,与脚本端的默认值耦合,不是新增契约)。
+                remote_good=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                  "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null" || true)
+                if [ "$remote_good" = "$GIT_SHA" ]; then
+                  echo "::notice::deploy ok — an earlier attempt completed on the host despite the SSH transport failure (verified via last_good_tag)"
+                  break
+                fi
+                echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
+              fi
               echo "deferred=true" >> "$GITHUB_OUTPUT"
               echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
               exit 3
@@ -232,6 +246,7 @@ jobs:
               echo "::error::deploy failed (rc=${rc}); host 已按探针门自动回滚,不重试"
               exit "$rc"
             fi
+            had_transport_failure=1
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "::error::SSH transport failed after ${max_attempts} attempts (rc=255)"
               exit 1
