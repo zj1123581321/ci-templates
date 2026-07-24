@@ -230,9 +230,9 @@ jobs:
           set -u
           webhook="${FEISHU_CI_WEBHOOK:-}"
           [[ -n "$webhook" ]] || exit 0
-          python3 - "$webhook" "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
           import json, sys
-          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[2]} D3 release deferred: service busy"}}))
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release deferred: service busy"}}))
           PY
 
       - name: Feishu release failure card (P0, fail-open)
@@ -245,7 +245,7 @@ jobs:
           set -u
           webhook="${FEISHU_CI_WEBHOOK:-}"
           [[ -n "$webhook" ]] || exit 0
-          python3 - "$webhook" "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
           import json, sys
-          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[2]} D3 release failed"}}))
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release failed"}}))
           PY

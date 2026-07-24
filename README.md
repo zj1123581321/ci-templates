@@ -56,9 +56,11 @@ services:
 启用后远端按服务忙锁再主机锁的顺序进入整组切换；忙时返回 rc=3，caller 只发黄色延后卡，
 不会 SSH 重试或提升 last-good。
 
-构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本会在同一个 host `flock` 临界区内拉取并
-将每张镜像 retag 为 `<image_name>:<sha>`，写入统一的 `D3_RELEASE_TAG` compose 环境文件，
-然后只执行一次 `docker compose up -d`。全部探针通过后才原子提升
+构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本分两个阶段运行：先在锁外拉取并校验这次发布的
+不可变 SHA 镜像并 retag 为 `<image_name>:<sha>`，完成本地 staging；随后才按忙锁 → host `flock`
+顺序进入临界区，在双锁内仅写入统一的 `D3_RELEASE_TAG` compose 环境文件，运行
+`config --images` 身份门禁、`docker compose up -d`、探针和 promote/rollback。这样等待服务忙锁时
+不会写 compose/env/state，也不会在拿到锁后重复拉取或 retag。全部探针通过后才原子提升
 `.deploy-state/release/last_good_{sha,manifest}`；失败时按旧 manifest 整组回滚，首次发布
 没有旧版本则明确失败，不会伪造 last-good。
 

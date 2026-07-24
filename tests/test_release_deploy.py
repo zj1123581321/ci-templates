@@ -289,6 +289,40 @@ exit 0
     assert "already local" in result.stdout
 
 
+def test_rollback_reuses_exact_registry_or_local_immutable_refs(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = pull ]; then exit 0; fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then
+  case "$3" in
+    registry/ns/frontend:abc123456789) exit 0 ;;
+    backend:abc123456789) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:abc123456789\\nbackend:abc123456789\\nfrontend:def567890123\\nbackend:def567890123\\n'
+fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    mock_curl(Path(env["CURL_BIN"]), "500")
+    result = run(env)
+    assert result.returncode != 0
+    lines = log.read_text().splitlines()
+    assert lines.count("pull registry/ns/frontend:def567890123") == 1
+    assert lines.count("pull registry/ns/backend:def567890123") == 1
+    assert not any("pull registry/ns/frontend:abc123456789" in line for line in lines)
+    assert not any("pull registry/ns/backend:abc123456789" in line for line in lines)
+    assert "using local immutable backend:abc123456789 for rollback" in result.stdout
+
+
 def _lock_holder(path: Path, mode: str = "-x", seconds: str = "1"):
     return subprocess.Popen(
         ["bash", "-c", f'exec 8>"$1"; flock {mode} 8; sleep "$2"', "holder", str(path), seconds],
@@ -333,10 +367,11 @@ def test_busy_lock_missing_file_warns_and_creates(tmp_path):
 
 
 def test_busy_lock_invalid_timeout_is_configuration_failure(tmp_path):
-    env, _ = base(tmp_path)
+    env, log = base(tmp_path)
     env.update(BUSY_LOCK_FILE=str(tmp_path / "busy.lock"), BUSY_LOCK_TIMEOUT="nope")
     result = run(env)
     assert result.returncode == 1
+    assert not log.exists() or "pull " not in log.read_text()
 
 
 def test_busy_gate_host_contention_releases_admission_fd(tmp_path):
@@ -382,17 +417,20 @@ def test_busy_lock_release_does_not_repeat_staged_pulls(tmp_path):
 def test_term_while_busy_lock_waiting_does_not_switch_release(tmp_path):
     env, log = base(tmp_path)
     busy = tmp_path / "busy.lock"
-    holder = _lock_holder(busy, seconds="2")
+    holder = _lock_holder(busy, seconds="30")
     time.sleep(0.05)
-    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="2")
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="30")
     started = time.time()
     proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    time.sleep(0.2)
-    proc.send_signal(signal.SIGTERM)
-    stdout, stderr = proc.communicate(timeout=4)
-    holder.wait(timeout=3)
+    try:
+        time.sleep(0.2)
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=3)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=3)
     assert proc.returncode != 0, stdout + stderr
-    assert time.time() - started < 4
+    assert time.time() - started < 3
     assert "compose" not in log.read_text()
     assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
 

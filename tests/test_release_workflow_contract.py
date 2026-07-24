@@ -64,3 +64,5 @@ def test_release_busy_lock_and_compose_identity_contract():
     assert "FEISHU_CI_TITLE_PREFIX" in text
     assert "--max-time 10" in text
     assert "json.dumps" in text
+    assert 'python3 - "$webhook"' not in text
+    assert '--data-binary @- "$webhook"' in text

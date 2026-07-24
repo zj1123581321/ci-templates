@@ -163,10 +163,16 @@ pull_and_retag() {
   for ((i = 0; i < ${#IMAGE_NAMES[@]}; i++)); do
     ref="${IMAGE_REFS[$i]}:${tag}"
     local_ref="${IMAGE_NAMES[$i]}:${tag}"
-    if [[ "$prefer_local" -eq 1 ]] && "$DOCKER_BIN" image inspect "$ref" >/dev/null 2>&1; then
-      "$DOCKER_BIN" tag "$ref" "$local_ref" || return 1
-      check_pending || return 130
-      continue
+    if [[ "$prefer_local" -eq 1 ]]; then
+      if "$DOCKER_BIN" image inspect "$ref" >/dev/null 2>&1; then
+        "$DOCKER_BIN" tag "$ref" "$local_ref" || return 1
+        check_pending || return 130
+        continue
+      elif "$DOCKER_BIN" image inspect "$local_ref" >/dev/null 2>&1; then
+        log "using local immutable ${local_ref} for rollback"
+        check_pending || return 130
+        continue
+      fi
     fi
     attempt=1
     while (( attempt <= PULL_RETRIES )); do
@@ -353,14 +359,15 @@ do_release() {
   return 1
 }
 
+if [[ -n "$BUSY_LOCK_FILE" ]] && ! is_positive_integer "$BUSY_LOCK_TIMEOUT"; then
+  log "BUSY_LOCK_TIMEOUT must be a positive integer, got: ${BUSY_LOCK_TIMEOUT}" >&2
+  exit 1
+fi
+
 mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
 exec 9>"$HOST_LOCK"
 stage_current_release || exit $?
 if [[ -n "$BUSY_LOCK_FILE" ]]; then
-  if ! is_positive_integer "$BUSY_LOCK_TIMEOUT"; then
-    log "BUSY_LOCK_TIMEOUT must be a positive integer, got: ${BUSY_LOCK_TIMEOUT}" >&2
-    exit 1
-  fi
   if [[ ! -e "$BUSY_LOCK_FILE" ]]; then
     log "WARN: busy lock file ${BUSY_LOCK_FILE} missing; creating it" >&2
     mkdir -p "$(dirname "$BUSY_LOCK_FILE")" || exit 1
@@ -370,27 +377,43 @@ if [[ -n "$BUSY_LOCK_FILE" ]]; then
   BUSY_LOCK_HELD=1
   _deadline=$((SECONDS + BUSY_LOCK_TIMEOUT))
   while :; do
+    check_pending || exit 130
     _remain=$(( _deadline - SECONDS ))
     if [[ "$_remain" -le 0 ]]; then
       log "service busy: deferred after ${BUSY_LOCK_TIMEOUT}s" >&2
       exit 3
     fi
+    # Keep each external flock/sleep bounded so TERM is observed quickly;
+    # SECONDS still enforces the full admission deadline.
+    _slice="$_remain"
+    [[ "$_slice" -gt 1 ]] && _slice=1
     _frc=0
-    flock -w "$_remain" -x 8 || _frc=$?
-    if [[ "$_frc" -eq 1 ]]; then
-      log "service busy: deferred after ${BUSY_LOCK_TIMEOUT}s" >&2
-      exit 3
-    elif [[ "$_frc" -ne 0 ]]; then
-      log "busy lock flock failed (rc=${_frc})" >&2
-      exit 1
+    flock -w "$_slice" -x 8 || _frc=$?
+    if [[ "$_frc" -ne 0 ]]; then
+      check_pending || exit 130
+      _remain=$(( _deadline - SECONDS ))
+      if [[ "$_remain" -le 0 ]]; then
+        log "service busy: deferred after ${BUSY_LOCK_TIMEOUT}s" >&2
+        exit 3
+      elif [[ "$_frc" -ne 1 ]]; then
+        log "busy lock flock failed (rc=${_frc})" >&2
+        exit 1
+      fi
+      continue
     fi
+    check_pending || { flock -u 8 2>/dev/null || true; exit 130; }
     if flock -n 9; then
+      check_pending || { flock -u 9 2>/dev/null || true; flock -u 8 2>/dev/null || true; exit 130; }
       break
     fi
     # Never hold service admission while waiting for the host lock.
-    flock -u 8
-    _nap=$(( _deadline - SECONDS )); [[ "$_nap" -gt 5 ]] && _nap=5
-    [[ "$_nap" -gt 0 ]] && sleep "$_nap"
+    flock -u 8 2>/dev/null || true
+    check_pending || exit 130
+    _nap=$(( _deadline - SECONDS )); [[ "$_nap" -gt 1 ]] && _nap=1
+    if [[ "$_nap" -gt 0 ]]; then
+      sleep "$_nap"
+      check_pending || exit 130
+    fi
   done
   log "busy lock + host lock acquired"
 else
