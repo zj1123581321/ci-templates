@@ -85,6 +85,20 @@ def run(env):
     return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
 
 
+def fail_mv_target(path: Path, suffix: str):
+    write_exec(
+        path,
+        f'''#!/bin/bash
+target=""
+for arg in "$@"; do target="$arg"; done
+case "$target" in
+  */{suffix}) exit 1 ;;
+esac
+exec /usr/bin/mv "$@"
+''',
+    )
+
+
 def test_group_deploy_retags_sha_and_compose_once(tmp_path):
     env, log = base(tmp_path)
     result = run(env)
@@ -214,6 +228,93 @@ def test_first_release_probe_failure_has_explicit_no_rollback(tmp_path):
     assert result.returncode != 0
     assert "no previous" in (result.stdout + result.stderr).lower()
     assert not (Path(env["STATE_DIR"]) / "last_good_sha").exists()
+
+
+def test_first_release_canonical_commit_failure_has_no_good_release(tmp_path):
+    env, log = base(tmp_path)
+    fail_mv_target(Path(env["DOCKER_BIN"]).parent / "mv", "last_good_release")
+    env["PATH"] = f'{Path(env["DOCKER_BIN"]).parent}:{os.environ["PATH"]}'
+    result = run(env)
+    state = Path(env["STATE_DIR"])
+    assert result.returncode != 0
+    assert "canonical" in (result.stdout + result.stderr).lower()
+    assert not (state / "last_good_release").exists()
+    assert not (state / "last_good_sha").exists()
+    assert not (state / "last_good_manifest").exists()
+
+
+def test_canonical_commit_failure_rolls_back_runtime_and_preserves_old_state(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    state = Path(env["STATE_DIR"])
+    before_release = (state / "last_good_release").read_bytes()
+    before_sha = (state / "last_good_sha").read_bytes()
+    before_manifest = (state / "last_good_manifest").read_bytes()
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = pull ]; then exit 0; fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:def567890123\\nbackend:def567890123\\nfrontend:abc123456789\\nbackend:abc123456789\\n'
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  env_file=""
+  read_next=0
+  for arg in "$@"; do
+    if [ "$read_next" = 1 ]; then env_file="$arg"; read_next=0; fi
+    if [ "$arg" = --env-file ]; then read_next=1; fi
+  done
+  printf 'compose-env=%s\\n' "$(cat "$env_file")" >> "{log}"
+fi
+exit 0
+''',
+    )
+    fail_mv_target(Path(env["DOCKER_BIN"]).parent / "mv", "last_good_release")
+    env["PATH"] = f'{Path(env["DOCKER_BIN"]).parent}:{os.environ["PATH"]}'
+    env["D3_RELEASE_TAG"] = "def567890123"
+    result = run(env)
+    lines = log.read_text().splitlines()
+    assert result.returncode != 0
+    assert sum(line.endswith("up -d") for line in lines) == 2
+    assert "compose-env=D3_RELEASE_TAG=def567890123" in lines
+    assert "compose-env=D3_RELEASE_TAG=abc123456789" in lines
+    assert (Path(env["DEPLOY_DIR"]) / ".d3-release.env").read_text() == "D3_RELEASE_TAG=abc123456789\n"
+    assert (state / "last_good_release").read_bytes() == before_release
+    assert (state / "last_good_sha").read_bytes() == before_sha
+    assert (state / "last_good_manifest").read_bytes() == before_manifest
+
+
+def test_legacy_refresh_failure_after_canonical_commit_is_fail_open(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    state = Path(env["STATE_DIR"])
+    old_sha = (state / "last_good_sha").read_bytes()
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = pull ]; then exit 0; fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:def567890123\\nbackend:def567890123\\n'
+fi
+exit 0
+''',
+    )
+    fail_mv_target(Path(env["DOCKER_BIN"]).parent / "mv", "last_good_sha")
+    env["PATH"] = f'{Path(env["DOCKER_BIN"]).parent}:{os.environ["PATH"]}'
+    env["D3_RELEASE_TAG"] = "def567890123"
+    result = run(env)
+    lines = log.read_text().splitlines()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sum(line.endswith("up -d") for line in lines) == 1
+    assert (state / "last_good_release").read_text().startswith("def567890123\n")
+    assert (state / "last_good_sha").read_bytes() == old_sha
+    assert "legacy last_good_sha update failed" in (result.stdout + result.stderr)
 
 
 def test_pull_or_compose_failure_never_runs_compose_for_partial_group(tmp_path):

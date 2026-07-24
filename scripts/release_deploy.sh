@@ -261,17 +261,33 @@ probe_release() {
 promote() {
   local sha="$1" source="$2"
   mkdir -p "$STATE_DIR" || return 1
+  # Prepare every artifact before the canonical commit point.  The canonical
+  # file is the only authoritative release record; legacy files are merely
+  # operator-facing compatibility views updated after its atomic rename.
   cp -- "$source" "${STAGING_PREFIX}.manifest" || return 1
   printf '%s\n' "$sha" > "${STAGING_PREFIX}.sha" || return 1
   {
     printf '%s\n' "$sha"
     cat -- "$source"
   } > "${STAGING_PREFIX}.release" || return 1
-  mv -f -- "${STAGING_PREFIX}.manifest" "$GOOD_MANIFEST_FILE" || return 1
-  mv -f -- "${STAGING_PREFIX}.sha" "$GOOD_SHA_FILE" || return 1
-  # last_good_release is the canonical atomic pair (SHA + complete manifest).
-  # The two legacy files remain for operator visibility/backward compatibility.
-  mv -f -- "${STAGING_PREFIX}.release" "$GOOD_RELEASE_FILE" || return 1
+
+  # Commit point: same-directory rename is atomic.  If it fails, the previous
+  # canonical file remains authoritative and callers must roll back runtime.
+  if ! mv -f -- "${STAGING_PREFIX}.release" "$GOOD_RELEASE_FILE"; then
+    log "canonical last_good_release commit failed; preserving previous release" >&2
+    return 1
+  fi
+
+  # Best-effort legacy views.  A partial legacy refresh must never turn a
+  # successful canonical commit into a deployment failure; future runs read
+  # last_good_release first and can repair these views.
+  if ! mv -f -- "${STAGING_PREFIX}.manifest" "$GOOD_MANIFEST_FILE"; then
+    log "WARN: legacy last_good_manifest update failed; canonical release remains authoritative" >&2
+  fi
+  if ! mv -f -- "${STAGING_PREFIX}.sha" "$GOOD_SHA_FILE"; then
+    log "WARN: legacy last_good_sha update failed; canonical release remains authoritative" >&2
+  fi
+  return 0
 }
 
 deploy_group() {
@@ -327,12 +343,16 @@ do_release() {
       # Ignore a second signal for the short canonical commit: once promotion
       # starts, both SHA and manifest move as one protected release decision.
       trap ':' INT TERM
-      promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" || return 1
-      log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
-      return 0
+      if promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST"; then
+        log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
+        return 0
+      fi
+      log "release ${D3_RELEASE_TAG} healthy but canonical promotion failed; rolling back" >&2
+      current_rc=1
+    else
+      log "release ${D3_RELEASE_TAG} probe gate failed"
+      current_rc=1
     fi
-    log "release ${D3_RELEASE_TAG} probe gate failed"
-    current_rc=1
   fi
 
   if [[ -n "$previous_sha" && -n "$previous_manifest" && -f "$previous_manifest" && "$previous_sha" != "$D3_RELEASE_TAG" ]]; then
