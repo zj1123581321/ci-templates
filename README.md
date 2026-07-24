@@ -52,6 +52,36 @@ jobs:
 > `host` 自 D3 激活起是 **Tailscale 可达地址**（IP/MagicDNS），不再是 `~/.ssh/config` 别名 ——
 > GitHub runner 上没有用户的 ssh config，临时入 tailnet 后只能按 IP 连。别名 `host-1` 仍用于 registry 与人读。
 
+## 部署门禁（可选）
+
+有的服务在跑不可打断任务（如录制、转写）时不希望被替换容器打断。开启后：
+服务侧对一个锁文件持**共享锁**（表示"有任务在跑，别打断我"）；部署脚本替换容器前
+对同一个文件申请**排他锁**——拿到即证明当前无任务在跑、且新任务也进不来，随即
+完成 `compose up -d` + 探针 +（如需）回滚；等待超过预算仍拿不到锁，则本次**延期**：
+旧容器原样保留，不做任何替换。
+
+opt-in 用法，在 caller 的 `with:` 块加两个 input（不加则行为与现状完全一致）：
+
+```yaml
+    with:
+      # ...其余 input 照常...
+      busy_lock_file: /srv/automation/web-api/.deploy-state/busy.lock
+      busy_lock_timeout: "600"   # 可选，默认 600s（10 分钟）
+```
+
+延期时的表现：GitHub job 仍是**失败态**（标红，诚实反映"新 SHA 未上线"），但通知
+分流成**飞书黄卡**（非红色 P0 卡、不 `@全员`）——因为这是正常的延期，不是故障。
+新镜像已经推到 ACR（不可变 SHA tag），空闲后点黄卡上的按钮手动 **Re-run** 该
+workflow 即可补上线，无需重新 build。
+
+> ⚠️ **上线顺序**：必须先让服务侧完成持锁实现并挂载好 `.deploy-state` 目录，
+> 用现有 D3 流程验证过一次正常部署之后，再给 caller 打开 `busy_lock_file`。
+> 顺序反了 = 锁文件没人持有 = 形同没有保护——部署脚本发现锁文件缺失时只会创建
+> 它并打一条显著 `WARN`，**不会**拦住部署（warn-and-proceed，不 fail-closed）。
+
+机制细节、锁文件挂载约定、退出码表、验收矩阵见
+[`docs/design/d3-busy-lock-gate.md`](docs/design/d3-busy-lock-gate.md)。
+
 部署失败通知读取调用方 repo variables:
 - `FEISHU_CI_WEBHOOK`: 目标飞书自定义机器人 webhook。
 - `FEISHU_CI_TITLE_PREFIX`: 机器人关键词标题前缀；未配置时默认 `[zlxlabs·CI]`。
