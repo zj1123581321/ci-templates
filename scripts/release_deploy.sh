@@ -159,6 +159,7 @@ pull_and_retag() {
     while (( attempt <= PULL_RETRIES )); do
       if "$DOCKER_BIN" pull "$ref"; then break; fi
       log "pull ${ref} failed (${attempt}/${PULL_RETRIES})"
+      check_pending || return 130
       if (( attempt == PULL_RETRIES )); then
         log "pull failed; compose will not run" >&2
         return 1
