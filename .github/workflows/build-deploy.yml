@@ -212,6 +212,21 @@ jobs:
                bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
+          # 门禁开启时先取 last_good 基线:后面 255→rc=3 的复核要证明的是"last_good 在
+          # 本次 run 期间才变成 GIT_SHA",光比对现值会把重跑已部署 SHA(手动 re-run,或
+          # 两次 push 恰好产生同一个 GIT_SHA)时的历史遗留同值误当成功证据。基线取不到
+          # (ssh 传输失败)就标记 __unknown__,复核时不做成功提升(没有对照基准,宁可保守
+          # 走 deferred)。远端文件不存在是合法的"此前无 last_good"状态,取到空字符串
+          # 即可,不算 unknown——两种"空"语义不同,不能混。只服务于忙锁门禁场景,未开
+          # 门禁的 caller 不会触发 rc=3,没必要多这次 ssh 调用。
+          pre_good="__unknown__"
+          if [ -n "$BUSY_LOCK_FILE" ]; then
+            if _pg=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                 "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null || true"); then
+              pre_good="$_pg"
+            fi
+          fi
+
           attempt=1; max_attempts=3; had_transport_failure=0
           while true; do
             rc=0; deploy_once || rc=$?
@@ -231,8 +246,15 @@ jobs:
                 # 既有约定,这里直接拼接路径,与脚本端的默认值耦合,不是新增契约)。
                 remote_good=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
                   "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null" || true)
-                if [ "$remote_good" = "$GIT_SHA" ]; then
-                  echo "::notice::deploy ok — an earlier attempt completed on the host despite the SSH transport failure (verified via last_good_tag)"
+                # 三条同时成立才提升为成功:
+                #   remote_good = GIT_SHA  —— 现在确实是这个 SHA
+                #   pre_good != GIT_SHA    —— 排除"重跑已部署过的同一个 SHA"这种历史
+                #                              遗留同值的假阳性,必须是本次 run 期间才
+                #                              变成这个值,才能证明这次 attempt 真的成功
+                #   pre_good != __unknown__ —— 基线本身没拿到就没有对照基准,不能做
+                #                              成功提升判断,宁可保守走 deferred
+                if [ "$remote_good" = "$GIT_SHA" ] && [ "$pre_good" != "$GIT_SHA" ] && [ "$pre_good" != "__unknown__" ]; then
+                  echo "::notice::deploy ok — an earlier attempt completed on the host despite the SSH transport failure (last_good_tag changed to ${GIT_SHA} during this run)"
                   break
                 fi
                 echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"

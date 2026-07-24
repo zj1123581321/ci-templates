@@ -189,6 +189,46 @@ def test_rc3_rechecks_remote_state_after_prior_transport_failure():
     # regression guard: deferred=true must still exist as the fallback outcome.
     assert "deferred=true" in text, "rc=3 must still be able to fall through to deferred when the recheck doesn't confirm success"
 
+    # code review round 6 (P1): remote_good == GIT_SHA alone doesn't prove the
+    # *current run* wrote that value — re-running an already-deployed SHA (e.g.
+    # a manual re-run, or two pushes that happen to produce the same GIT_SHA)
+    # can leave last_good_tag pre-equal to GIT_SHA before this run's loop even
+    # starts. In that case a real attempt-1 probe failure (whose rollback branch
+    # is itself skipped when prev_good == GIT_SHA) followed by a transport hiccup
+    # would wrongly be "verified" as success by the R5 check alone. The recheck
+    # must also prove last_good_tag *changed to* GIT_SHA during this run, by
+    # comparing against a pre-loop baseline (pre_good).
+    assert "pre_good" in text, (
+        "the recheck must capture a pre-loop baseline of last_good_tag (pre_good) "
+        "so it can distinguish 'changed during this run' from 'already this value "
+        "before this run started'"
+    )
+
+    idx_while = text.index("while true")
+    idx_pre_good_init = text.index("pre_good=")
+    assert idx_pre_good_init < idx_while, (
+        "pre_good's baseline capture must happen before the retry loop starts, "
+        "not inside it — otherwise it can't represent the pre-run state"
+    )
+
+    # the success-promotion if-condition must require all three: remote_good
+    # matches GIT_SHA now, pre_good was different before this run (i.e. it
+    # actually changed during this run), and pre_good was obtainable at all
+    # (not "__unknown__" — no baseline means no proof, so don't promote).
+    idx_remote_good_if = text.index('"$remote_good" = "$GIT_SHA"')
+    line_start = text.rindex("\n", 0, idx_remote_good_if) + 1
+    line_end = text.index("\n", idx_remote_good_if)
+    promotion_line = text[line_start:line_end]
+    assert "pre_good" in promotion_line, (
+        "the success-promotion if-condition must also reference pre_good, not "
+        "just remote_good — otherwise a historical same-value coincidence is "
+        "indistinguishable from an in-run success"
+    )
+    assert "__unknown__" in promotion_line, (
+        "the success-promotion if-condition must refuse to promote to success "
+        "when the pre-loop baseline itself couldn't be fetched (ssh failure)"
+    )
+
 
 def test_red_card_step_skips_when_deferred():
     text = WORKFLOW.read_text()
