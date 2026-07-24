@@ -93,3 +93,160 @@ def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "[zlxlabs·CI]" in text
     assert "f\"🔴 {title_prefix} P0 部署失败" in text
+
+
+# --- busy-lock gate: inputs 透传 + rc=3 deferred 分流 + 双卡通知 --------------
+
+def test_busy_lock_inputs_declared_with_safe_defaults():
+    raw, trigger = _load()
+    inputs = trigger["workflow_call"]["inputs"]
+
+    assert "busy_lock_file" in inputs
+    assert inputs["busy_lock_file"].get("default") == ""
+    assert inputs["busy_lock_file"].get("required") is not True
+
+    assert "busy_lock_timeout" in inputs
+    assert inputs["busy_lock_timeout"].get("default") == "600"
+
+
+def test_busy_lock_env_is_passed_through_to_deploy_step():
+    text = WORKFLOW.read_text()
+    assert "BUSY_LOCK_FILE" in text
+    assert "BUSY_LOCK_TIMEOUT" in text
+    assert "inputs.busy_lock_file" in text
+    assert "inputs.busy_lock_timeout" in text
+
+
+def test_deferred_exit_code_writes_output_before_nonzero_exit():
+    text = WORKFLOW.read_text()
+    assert "deferred=true" in text
+    assert "GITHUB_OUTPUT" in text
+    # rc=3 判断必须先于笼统的 "!= 255" 判断,否则 deferred 会被误判为
+    # "已按探针门自动回滚" 报错退出,语义就错了。
+    idx_rc3 = text.index('"$rc" -eq 3')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    assert idx_rc3 < idx_rc_ne_255, "rc=3 分支必须在 != 255 判断之前"
+
+
+def test_remote_script_path_is_unique_per_run():
+    # code review round 4 (P1): a fixed remote path (/tmp/pull_and_deploy.sh) is
+    # NOT isolated across different service repos deploying to the same host —
+    # GitHub concurrency groups are per-repo, not cross-repo. Two service repos
+    # racing on the same box would clobber each other's script file, silently
+    # executing whatever got written last (e.g. an old script without the
+    # busy-lock gate logic, even though the busy-lock env vars were passed).
+    # The remote path must be unique per workflow run so concurrent deploys
+    # from different repos never collide on the same file.
+    text = WORKFLOW.read_text()
+
+    assert "GITHUB_RUN_ID" in text, "remote script path must be derived from the run id to be unique per run"
+
+    # the same variable must be used both when scp'ing the script up and when
+    # ssh invoking `bash <path>` — otherwise the two paths could drift apart.
+    assert "REMOTE_SCRIPT" in text, "expected a REMOTE_SCRIPT variable naming the unique remote path"
+    assert '${REMOTE_SCRIPT}' in text or "$REMOTE_SCRIPT" in text
+
+    # used-then-deleted: the remote script must be cleaned up after execution.
+    assert "rm -f" in text
+    rm_idx = text.index("rm -f")
+    nearby = text[max(0, rm_idx - 200): rm_idx + 200]
+    assert "REMOTE_SCRIPT" in nearby, "rm -f must target the same REMOTE_SCRIPT path that was scp'd up"
+
+    # regression guard: the old fixed path must be gone entirely.
+    assert ":/tmp/pull_and_deploy.sh" not in text, "fixed remote path must not reappear — it's the bug this test guards against"
+
+
+def test_rc3_rechecks_remote_state_after_prior_transport_failure():
+    # code review round 5 (P1): a 255 (SSH transport failure) can happen AFTER the
+    # remote deploy already finished (compose up + probe passed + last_good_tag
+    # written) but before the exit code made it back over the wire. A retry then
+    # sees rc=3 (busy lock held by the just-started new container) and — without
+    # this recheck — would misreport "deferred: old container kept", which is the
+    # opposite of what actually happened. The workflow must track whether a 255
+    # occurred earlier in this run, and if so, verify via the host's
+    # last_good_tag before trusting rc=3's "deferred" story.
+    text = WORKFLOW.read_text()
+
+    assert "had_transport_failure" in text, (
+        "must track whether an earlier attempt in this run hit rc=255, so a later "
+        "rc=3 can be recognised as potentially stale rather than trusted at face value"
+    )
+    assert "last_good_tag" in text, (
+        "rc=3 recheck must consult the host's last_good_tag to see whether an "
+        "earlier (transport-failed) attempt actually already deployed GIT_SHA"
+    )
+
+    # had_transport_failure must be initialised before the loop, set on the 255
+    # branch, and consulted inside the rc=3 branch — not just present anywhere.
+    idx_init = text.index("had_transport_failure=0")
+    idx_rc3 = text.index('"$rc" -eq 3')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    idx_set = text.index("had_transport_failure=1")
+    assert idx_init < idx_rc3, "had_transport_failure must be initialised before the loop"
+    # the flag is set once rc is known to be 255, i.e. after the "!= 255" guard
+    assert idx_rc_ne_255 < idx_set, "had_transport_failure=1 must be set on the confirmed-255 path"
+
+    # regression guard: deferred=true must still exist as the fallback outcome.
+    assert "deferred=true" in text, "rc=3 must still be able to fall through to deferred when the recheck doesn't confirm success"
+
+    # code review round 6 (P1): remote_good == GIT_SHA alone doesn't prove the
+    # *current run* wrote that value — re-running an already-deployed SHA (e.g.
+    # a manual re-run, or two pushes that happen to produce the same GIT_SHA)
+    # can leave last_good_tag pre-equal to GIT_SHA before this run's loop even
+    # starts. In that case a real attempt-1 probe failure (whose rollback branch
+    # is itself skipped when prev_good == GIT_SHA) followed by a transport hiccup
+    # would wrongly be "verified" as success by the R5 check alone. The recheck
+    # must also prove last_good_tag *changed to* GIT_SHA during this run, by
+    # comparing against a pre-loop baseline (pre_good).
+    assert "pre_good" in text, (
+        "the recheck must capture a pre-loop baseline of last_good_tag (pre_good) "
+        "so it can distinguish 'changed during this run' from 'already this value "
+        "before this run started'"
+    )
+
+    idx_while = text.index("while true")
+    idx_pre_good_init = text.index("pre_good=")
+    assert idx_pre_good_init < idx_while, (
+        "pre_good's baseline capture must happen before the retry loop starts, "
+        "not inside it — otherwise it can't represent the pre-run state"
+    )
+
+    # the success-promotion if-condition must require all three: remote_good
+    # matches GIT_SHA now, pre_good was different before this run (i.e. it
+    # actually changed during this run), and pre_good was obtainable at all
+    # (not "__unknown__" — no baseline means no proof, so don't promote).
+    idx_remote_good_if = text.index('"$remote_good" = "$GIT_SHA"')
+    line_start = text.rindex("\n", 0, idx_remote_good_if) + 1
+    line_end = text.index("\n", idx_remote_good_if)
+    promotion_line = text[line_start:line_end]
+    assert "pre_good" in promotion_line, (
+        "the success-promotion if-condition must also reference pre_good, not "
+        "just remote_good — otherwise a historical same-value coincidence is "
+        "indistinguishable from an in-run success"
+    )
+    assert "__unknown__" in promotion_line, (
+        "the success-promotion if-condition must refuse to promote to success "
+        "when the pre-loop baseline itself couldn't be fetched (ssh failure)"
+    )
+
+
+def test_red_card_step_skips_when_deferred():
+    text = WORKFLOW.read_text()
+    assert "deferred != 'true'" in text
+
+
+def test_yellow_card_step_exists_for_deferred_without_at_all():
+    text = WORKFLOW.read_text()
+    assert "deferred == 'true'" in text
+    assert "部署延期" in text
+
+    # 定位黄卡那一段(从"部署延期"关键词往后切),只在这一段里断言不含 <at id=all>;
+    # 红卡那段仍然应该含 <at id=all>,不能用"全文不含"这种粗暴断言。
+    idx = text.index("部署延期")
+    yellow_section = text[idx:]
+    assert "<at id=all>" not in yellow_section
+
+    red_idx = text.index("Feishu 部署失败卡")
+    # 红卡段落(该 step 起,到黄卡关键词出现前)仍然要 @全员
+    red_section = text[red_idx:idx]
+    assert "<at id=all>" in red_section

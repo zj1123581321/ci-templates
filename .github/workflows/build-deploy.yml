@@ -66,6 +66,15 @@ on:
         required: false
         default: "10"
         type: string
+      busy_lock_file:
+        description: "opt-in deploy gate: path to a service-held flock busy lock (e.g. <deploy_dir>/.deploy-state/busy.lock). Empty (default) disables the gate — behavior unchanged."
+        required: false
+        default: ""
+        type: string
+      busy_lock_timeout:
+        required: false
+        default: "600"
+        type: string
       ci_templates_ref:
         description: "Ref of ci-templates to fetch the deploy scripts from"
         required: false
@@ -148,6 +157,7 @@ jobs:
           chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy over SSH (flock + health probe + auto-rollback)
+        id: deploy
         env:
           ACR_REGISTRY: ${{ inputs.acr_registry }}
           ACR_NAMESPACE: ${{ inputs.acr_namespace }}
@@ -161,6 +171,8 @@ jobs:
           HEALTHCHECK_RETRIES: ${{ inputs.healthcheck_retries }}
           HEALTHCHECK_INTERVAL: ${{ inputs.healthcheck_interval }}
           HEALTHCHECK_WARMUP: ${{ inputs.healthcheck_warmup }}
+          BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
+          BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
         run: |
           ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
           # keepalive 防 tailnet 上偶发的 `Connection reset ...:22`(canary 遇过,50 服务规模会常遇):
@@ -173,11 +185,19 @@ jobs:
           #   255 = SSH/scp 传输层失败(Connection reset / timeout)→ 瞬时,安全重试
           #   1   = pull_and_deploy.sh 主动失败(探针挂,且已在 host 端自动回滚)
           #         → 真实坏部署,绝不重试(否则重拉/重部/重滚 3 遍,搅乱生产)
+          #   3   = deferred:busy-lock 门禁(opt-in)超时未等到,服务忙,旧容器保留
+          #         → 不是故障,不重试;写 deferred=true 分流去黄卡,等空闲手动 re-run
           # scp 只是拷个脚本文件(无副作用),失败一律归到 255 当瞬时重试;
           # ssh 透传远端脚本的退出码,1 与 255 在此被区分对待。
+          # 远端脚本路径必须每次 run 唯一:GitHub concurrency 是 repo 级隔离,不跨仓库
+          # 互斥。同一台主机上如果两个不同服务仓并发部署(各自引用不同 tag,脚本内容
+          # 可能不同),固定路径 /tmp/pull_and_deploy.sh 会被互相覆盖——新脚本可能被
+          # 旧脚本覆盖后静默执行,门禁这类新增的安全逻辑可以被这样绕过而不自知。
+          REMOTE_SCRIPT="/tmp/pull_and_deploy.${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
+
           deploy_once() {
             scp $SSH_OPTS .ci-templates/scripts/pull_and_deploy.sh \
-              "${SSH_USER}@${DEPLOY_HOST}:/tmp/pull_and_deploy.sh" || return 255
+              "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
               "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
                GIT_SHA='${GIT_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' \
@@ -187,21 +207,68 @@ jobs:
                HEALTHCHECK_RETRIES='${HEALTHCHECK_RETRIES}' \
                HEALTHCHECK_INTERVAL='${HEALTHCHECK_INTERVAL}' \
                HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
-               bash /tmp/pull_and_deploy.sh"
+               BUSY_LOCK_FILE='${BUSY_LOCK_FILE}' \
+               BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
+               bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
-          attempt=1; max_attempts=3
+          # 门禁开启时先取 last_good 基线:后面 255→rc=3 的复核要证明的是"last_good 在
+          # 本次 run 期间才变成 GIT_SHA",光比对现值会把重跑已部署 SHA(手动 re-run,或
+          # 两次 push 恰好产生同一个 GIT_SHA)时的历史遗留同值误当成功证据。基线取不到
+          # (ssh 传输失败)就标记 __unknown__,复核时不做成功提升(没有对照基准,宁可保守
+          # 走 deferred)。远端文件不存在是合法的"此前无 last_good"状态,取到空字符串
+          # 即可,不算 unknown——两种"空"语义不同,不能混。只服务于忙锁门禁场景,未开
+          # 门禁的 caller 不会触发 rc=3,没必要多这次 ssh 调用。
+          pre_good="__unknown__"
+          if [ -n "$BUSY_LOCK_FILE" ]; then
+            if _pg=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                 "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null || true"); then
+              pre_good="$_pg"
+            fi
+          fi
+
+          attempt=1; max_attempts=3; had_transport_failure=0
           while true; do
             rc=0; deploy_once || rc=$?
             if [ "$rc" -eq 0 ]; then
               echo "::notice::deploy ok (attempt ${attempt}/${max_attempts})"
               break
             fi
+            if [ "$rc" -eq 3 ]; then
+              # deferred:busy-lock 门禁(opt-in)超时未等到,服务忙,旧容器保留。
+              # 顺序很重要:必须先于下面 "!= 255" 的判断拦截,否则会被误判为
+              # "已按探针门自动回滚" 报错退出,语义就错了(那是给探针失败用的)。
+              if [ "$had_transport_failure" = "1" ]; then
+                # 之前出过 255:那一次远端可能已完成部署,只是退出码没传回来。rc=3 只
+                # 说明"现在拿不到锁",不能证明"旧容器还在"。用远端 last_good_tag(部署
+                # 脚本探针通过后才写入的既有状态,不新增任何机制)复核真实状态再分类。
+                # STATE_DIR 默认是 ${DEPLOY_DIR}/.deploy-state(pull_and_deploy.sh 里的
+                # 既有约定,这里直接拼接路径,与脚本端的默认值耦合,不是新增契约)。
+                remote_good=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                  "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null" || true)
+                # 三条同时成立才提升为成功:
+                #   remote_good = GIT_SHA  —— 现在确实是这个 SHA
+                #   pre_good != GIT_SHA    —— 排除"重跑已部署过的同一个 SHA"这种历史
+                #                              遗留同值的假阳性,必须是本次 run 期间才
+                #                              变成这个值,才能证明这次 attempt 真的成功
+                #   pre_good != __unknown__ —— 基线本身没拿到就没有对照基准,不能做
+                #                              成功提升判断,宁可保守走 deferred
+                if [ "$remote_good" = "$GIT_SHA" ] && [ "$pre_good" != "$GIT_SHA" ] && [ "$pre_good" != "__unknown__" ]; then
+                  echo "::notice::deploy ok — an earlier attempt completed on the host despite the SSH transport failure (last_good_tag changed to ${GIT_SHA} during this run)"
+                  break
+                fi
+                echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
+              fi
+              echo "deferred=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
+              exit 3
+            fi
             if [ "$rc" -ne 255 ]; then
               # 脚本主动失败(已回滚)—— 真实问题,立即上报,不重试
               echo "::error::deploy failed (rc=${rc}); host 已按探针门自动回滚,不重试"
               exit "$rc"
             fi
+            had_transport_failure=1
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "::error::SSH transport failed after ${max_attempts} attempts (rc=255)"
               exit 1
@@ -218,7 +285,7 @@ jobs:
       # 凭据 = 调用方服务仓的 repo 变量 vars.FEISHU_CI_WEBHOOK(关键词模式,无 secret);
       # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
-        if: failure()
+        if: failure() && steps.deploy.outputs.deferred != 'true'
         continue-on-error: true
         env:
           FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
@@ -257,6 +324,62 @@ jobs:
                       {"tag": "div", "text": {"tag": "lark_md", "content": body}},
                       {"tag": "action", "actions": [
                           {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
+                           "type": "primary", "url": run_url},
+                      ]},
+                  ],
+              },
+          }
+          req = urllib.request.Request(
+              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+          except Exception as e:
+              print("feishu notify failed (swallowed):", e)
+          PY
+
+      # deferred(rc=3):busy-lock 门禁(opt-in)超时未等到,服务忙,不是故障。
+      # job 仍标红(诚实反映"新 SHA 未上线"),但通知分流成黄卡:不 @全员,
+      # 语义是"正常延期,构建已在库,空闲后点按钮 re-run"——与红卡的"真实故障"分开。
+      - name: Feishu 部署延期卡 (deferred, fail-open)
+        if: failure() && steps.deploy.outputs.deferred == 'true'
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          SVC:     ${{ inputs.image_name }}
+          HOST:    ${{ inputs.host }}
+          REPO:    ${{ github.repository }}
+          SHA:     ${{ steps.sha.outputs.git_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          svc     = os.environ.get("SVC", "") or "?"
+          host    = os.environ.get("HOST", "") or "?"
+          repo    = os.environ["REPO"]
+          sha     = os.environ.get("SHA", "") or "?"
+          run_url = os.environ["RUN_URL"]
+          # 黄卡:不 @全员——这是正常延期,不是故障,不该打扰全群。
+          body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
+                  f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
+                  f"服务忙(长任务进行中),本次**部署延期,未替换**——旧版本继续运行,生产不受影响。\n"
+                  f"镜像 `{sha}` 已构建并推送 ACR;空闲后点按钮 **重跑部署**即可上线"
+                  f"(重跑会在新 runner 上完整重建同一 SHA 镜像,产物不变,只是多花几分钟构建时间)。")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"template": "yellow",
+                             "title": {"tag": "plain_text", "content": f"⏸️ {title_prefix} 部署延期 · {svc}"}},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "重跑部署"},
                            "type": "primary", "url": run_url},
                       ]},
                   ],

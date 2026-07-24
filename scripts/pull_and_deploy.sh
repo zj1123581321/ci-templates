@@ -7,6 +7,10 @@
 #   - last-good tracking  : records the last healthy tag for rollback
 #   - health probe gate   : warmup + retries + expected status
 #   - auto rollback       : probe failure -> redeploy previous good tag
+#   - busy-lock gate      : opt-in (BUSY_LOCK_FILE); exit codes: 0=healthy,
+#                           1=probe failed (rolled back), 3=deferred (service
+#                           busy, busy lock not acquired in time, old
+#                           container untouched)
 #
 # All inputs come from the environment so the build-deploy.yml job can export
 # them and so tests can inject mocks (DOCKER_BIN / CURL_BIN).
@@ -23,6 +27,9 @@ STATE_DIR="${STATE_DIR:-${DEPLOY_DIR}/.deploy-state}"
 HOST_LOCK="${HOST_LOCK:-/var/lock/fleet-deploy.lock}"   # ONE lock per host
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 CURL_BIN="${CURL_BIN:-curl}"
+
+BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"        # opt-in deploy gate; empty = off
+BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 
 PULL_RETRIES="${PULL_RETRIES:-3}"
 PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"  # base seconds; backoff = delay * attempt
@@ -42,6 +49,10 @@ GOOD_TAG_FILE="${STATE_DIR}/last_good_tag"
 
 log()   { echo "[deploy] $*"; }
 event() { [ -n "$DEPLOY_EVENT_LOG" ] && echo "$1:${DEPLOY_ID}" >> "$DEPLOY_EVENT_LOG" || true; }
+
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
 
 # --- pull with retry + local fallback ----------------------------------------
 # 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
@@ -123,10 +134,81 @@ do_deploy() {
   return 1
 }
 
+# --- busy-lock deploy gate (opt-in; BUSY_LOCK_FILE empty = skip entirely) ----
+# 服务侧每个不可打断任务存续期间对这个文件持共享锁(LOCK_SH);这里在替换容器前
+# 申请排他锁(LOCK_EX) —— 拿到即证明"无进行中任务,且新任务进不来"。
+# 锁申请顺序固定:先忙锁(fd 8,服务级) 后 HOST_LOCK(fd 9,整机级)——每个服务的忙锁
+# 文件互不相同,HOST_LOCK 全局只有一把,顺序固定的两级锁不构成环,不会死锁。
+# 但"申请顺序固定"不等于"等待期间可以互相攥着":两把锁只应该在真正的替换窗口
+# (即将 compose up 之前)同时持有;在等待阶段,任何时刻最多只持有正在等的那一把,
+# 绝不允许"因为在等 HOST_LOCK,所以顺手一直攥着已经到手的忙锁"——那会让 admission
+# 在纯排队等待、尚未开始替换容器的时间里被误关,反而伤到这套门禁本该保护的对象。
+# 做法是一个循环:申请忙锁(带预算)→ 非阻塞探 HOST_LOCK → HOST_LOCK 被占就立即
+# 放掉忙锁、sleep 5s 后重试整对锁 → 总预算(BUSY_LOCK_TIMEOUT)耗尽仍未能同时拿到
+# 两把锁,则本次 deferred。
 mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
 exec 9>"$HOST_LOCK"
-flock 9          # blocks until this host's deploy lock is free
+
+if [ -n "$BUSY_LOCK_FILE" ]; then
+  if ! is_positive_integer "$BUSY_LOCK_TIMEOUT"; then
+    log "BUSY_LOCK_TIMEOUT must be a positive integer, got: ${BUSY_LOCK_TIMEOUT}"
+    exit 1
+  fi
+  # pre-pull outside all locks: shrinks the admission-closed window to seconds
+  pull_image "${ACR_IMAGE}:${GIT_SHA}"
+  if [ ! -e "$BUSY_LOCK_FILE" ]; then
+    log "WARN: busy lock file ${BUSY_LOCK_FILE} missing — service side may not hold locks yet; creating it, proceeding WITHOUT drain protection"
+    mkdir -p "$(dirname "$BUSY_LOCK_FILE")"
+    : >> "$BUSY_LOCK_FILE"   # append-open 的空操作：绝不 truncate，只是把文件创建出来
+  fi
+  # 只读打开：服务侧(容器内进程)创建的锁文件通常属主是容器内用户/root、权限较窄
+  # (如 0644),宿主上跑部署脚本的用户往往只有读权限、没有写权限。flock(2) 的互斥
+  # 语义作用在文件的 inode 上,不要求持有该锁的 fd 具备写权限——只读 fd 一样能申请
+  # LOCK_EX/LOCK_SH。这里改成只读打开以兼容"部署用户对锁文件只读"的真实场景，
+  # 语义与之前的 append-open 完全一致，只是不再要求写权限。
+  exec 8<"$BUSY_LOCK_FILE"
+
+  _deadline=$(( SECONDS + BUSY_LOCK_TIMEOUT ))
+  while :; do
+    _remain=$(( _deadline - SECONDS ))
+    if [ "$_remain" -le 0 ]; then
+      log "service busy: host deploy lock busy through the whole ${BUSY_LOCK_TIMEOUT}s budget — DEFERRED, old container kept"
+      exit 3
+    fi
+    _frc=0; flock -w "$_remain" -x 8 || _frc=$?
+    if [ "$_frc" -eq 1 ]; then
+      log "service busy: busy lock not acquired within budget — DEFERRED, old container kept"
+      exit 3
+    elif [ "$_frc" -ne 0 ]; then
+      log "flock on busy lock failed with rc=${_frc} (not a lock timeout — config or host problem)"
+      exit 1
+    fi
+    if flock -n 9; then
+      break            # 两把锁同时在手 → 替换窗口开始
+    fi
+    flock -u 8         # 整机锁被别的部署占着:立即放掉忙锁,admission 重新打开
+    # 重试前的休眠要 clamp 到"剩余预算"和 5s 两者中较小值:固定 sleep 5 在剩余预算
+    # 不足 5 秒时(比如 BUSY_LOCK_TIMEOUT=2)会把总等待拖过用户配置的预算上限,
+    # clamp 之后循环顶部的预算耗尽判断才能准时生效,deferred 不会被这一觉睡过头。
+    _nap=$(( _deadline - SECONDS ))
+    if [ "$_nap" -gt 5 ]; then _nap=5; fi
+    if [ "$_nap" -gt 0 ]; then sleep "$_nap"; fi
+  done
+  log "busy lock + host deploy lock both acquired (admission closed until replace completes)"
+fi
+
+# opt-in 路径:fd 9 上面已经通过 flock -n 9 拿到锁了,这一行只是确认——同一进程对
+# 同一 fd 重复 flock 是空操作,立即成功返回,不会阻塞。
+# opt-out 路径:busy-lock if 块整体跳过,fd 9 尚未加锁,这一行就是原来的行为——
+# 阻塞直到这台主机的部署锁空闲。
+flock 9
 do_deploy
 rc=$?
 flock -u 9
+# fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于
+# fd 9 释放,才能保证 admission 在 compose up + 探针 + 回滚全程都是关闭的。
+# 这里选择显式 flock -u 8(而不是依赖脚本 exit 时内核自动释放两把锁):两者都
+# 安全(内核保证进程退出必然释放所有 flock),但显式释放让代码里的锁生命周期
+# 一目了然,也让"9 先于 8 释放"的顺序不依赖读者去脑补 exit 的隐式行为。
+[ -n "$BUSY_LOCK_FILE" ] && flock -u 8
 exit $rc
