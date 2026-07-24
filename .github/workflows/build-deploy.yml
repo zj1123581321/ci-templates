@@ -189,9 +189,15 @@ jobs:
           #         → 不是故障,不重试;写 deferred=true 分流去黄卡,等空闲手动 re-run
           # scp 只是拷个脚本文件(无副作用),失败一律归到 255 当瞬时重试;
           # ssh 透传远端脚本的退出码,1 与 255 在此被区分对待。
+          # 远端脚本路径必须每次 run 唯一:GitHub concurrency 是 repo 级隔离,不跨仓库
+          # 互斥。同一台主机上如果两个不同服务仓并发部署(各自引用不同 tag,脚本内容
+          # 可能不同),固定路径 /tmp/pull_and_deploy.sh 会被互相覆盖——新脚本可能被
+          # 旧脚本覆盖后静默执行,门禁这类新增的安全逻辑可以被这样绕过而不自知。
+          REMOTE_SCRIPT="/tmp/pull_and_deploy.${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
+
           deploy_once() {
             scp $SSH_OPTS .ci-templates/scripts/pull_and_deploy.sh \
-              "${SSH_USER}@${DEPLOY_HOST}:/tmp/pull_and_deploy.sh" || return 255
+              "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
               "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
                GIT_SHA='${GIT_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' \
@@ -203,7 +209,7 @@ jobs:
                HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
                BUSY_LOCK_FILE='${BUSY_LOCK_FILE}' \
                BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
-               bash /tmp/pull_and_deploy.sh"
+               bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
           attempt=1; max_attempts=3
@@ -218,7 +224,7 @@ jobs:
               # 顺序很重要:必须先于下面 "!= 255" 的判断拦截,否则会被误判为
               # "已按探针门自动回滚" 报错退出,语义就错了(那是给探针失败用的)。
               echo "deferred=true" >> "$GITHUB_OUTPUT"
-              echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle."
+              echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
               exit 3
             fi
             if [ "$rc" -ne 255 ]; then
@@ -325,7 +331,8 @@ jobs:
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
                   f"服务忙(长任务进行中),本次**部署延期,未替换**——旧版本继续运行,生产不受影响。\n"
-                  f"镜像 `{sha}` 已构建并推送 ACR,无需重新 build;空闲后点按钮 **重跑部署**即可上线。")
+                  f"镜像 `{sha}` 已构建并推送 ACR;空闲后点按钮 **重跑部署**即可上线"
+                  f"(重跑会在新 runner 上完整重建同一 SHA 镜像,产物不变,只是多花几分钟构建时间)。")
           card = {
               "msg_type": "interactive",
               "card": {

@@ -128,6 +128,34 @@ def test_deferred_exit_code_writes_output_before_nonzero_exit():
     assert idx_rc3 < idx_rc_ne_255, "rc=3 分支必须在 != 255 判断之前"
 
 
+def test_remote_script_path_is_unique_per_run():
+    # code review round 4 (P1): a fixed remote path (/tmp/pull_and_deploy.sh) is
+    # NOT isolated across different service repos deploying to the same host —
+    # GitHub concurrency groups are per-repo, not cross-repo. Two service repos
+    # racing on the same box would clobber each other's script file, silently
+    # executing whatever got written last (e.g. an old script without the
+    # busy-lock gate logic, even though the busy-lock env vars were passed).
+    # The remote path must be unique per workflow run so concurrent deploys
+    # from different repos never collide on the same file.
+    text = WORKFLOW.read_text()
+
+    assert "GITHUB_RUN_ID" in text, "remote script path must be derived from the run id to be unique per run"
+
+    # the same variable must be used both when scp'ing the script up and when
+    # ssh invoking `bash <path>` — otherwise the two paths could drift apart.
+    assert "REMOTE_SCRIPT" in text, "expected a REMOTE_SCRIPT variable naming the unique remote path"
+    assert '${REMOTE_SCRIPT}' in text or "$REMOTE_SCRIPT" in text
+
+    # used-then-deleted: the remote script must be cleaned up after execution.
+    assert "rm -f" in text
+    rm_idx = text.index("rm -f")
+    nearby = text[max(0, rm_idx - 200): rm_idx + 200]
+    assert "REMOTE_SCRIPT" in nearby, "rm -f must target the same REMOTE_SCRIPT path that was scp'd up"
+
+    # regression guard: the old fixed path must be gone entirely.
+    assert ":/tmp/pull_and_deploy.sh" not in text, "fixed remote path must not reappear — it's the bug this test guards against"
+
+
 def test_red_card_step_skips_when_deferred():
     text = WORKFLOW.read_text()
     assert "deferred != 'true'" in text
