@@ -132,7 +132,7 @@ def test_pull_or_compose_failure_never_runs_compose_for_partial_group(tmp_path):
     env, log = base(tmp_path, fail_pull=True)
     result = run(env)
     assert result.returncode != 0
-    assert "compose" not in log.read_text()
+    assert not log.exists() or "compose" not in log.read_text()
 
     env, log = base(tmp_path, compose_rc=1)
     result = run(env)
@@ -146,6 +146,17 @@ def test_retag_failure_never_runs_compose(tmp_path):
     result = run(env)
     assert result.returncode != 0
     assert "compose" not in log.read_text()
+
+
+def test_remote_manifest_rejects_zero_probes_defense_in_depth(tmp_path):
+    env, log = base(tmp_path)
+    Path(env["RELEASE_MANIFEST"]).write_text(
+        "D3_RELEASE_MANIFEST=1\nimage\tfrontend\tfrontend\n"
+    )
+    result = run(env)
+    assert result.returncode != 0
+    assert "probe" in (result.stdout + result.stderr).lower()
+    assert not log.exists() or "compose" not in log.read_text()
 
 
 def test_rollback_pull_failure_preserves_atomic_previous_release(tmp_path):
@@ -206,6 +217,35 @@ exit 0
     assert (state / "last_good_release").read_text() == before
     assert not list(state.glob(".release-*.release"))
     # The lock is not leaked by the signal handler.
+    assert run(env).returncode == 0
+
+
+def test_term_during_pull_does_not_start_new_compose(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    state = Path(env["STATE_DIR"])
+    before = (state / "last_good_release").read_text()
+    log.write_text("")
+    marker = tmp_path / "pull.started"
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = pull ]; then touch "{marker}"; sleep 0.3; fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 3
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=5)
+    assert proc.returncode != 0, stdout + stderr
+    lines = log.read_text().splitlines()
+    assert sum(line.startswith("compose ") for line in lines) <= 1
+    assert (state / "last_good_release").read_text() == before
     assert run(env).returncode == 0
 
 

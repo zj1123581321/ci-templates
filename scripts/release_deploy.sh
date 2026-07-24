@@ -36,6 +36,7 @@ ENV_FILE="$DEPLOY_DIR/.d3-release.env"
 LOCK_FD=9
 STAGING_PREFIX="$STATE_DIR/.release-${D3_RELEASE_TAG}-$$"
 PENDING_SIGNAL=""
+ROLLBACK_MODE=0
 
 [[ "$D3_RELEASE_TAG" =~ ^[0-9a-f]{12}$ ]] || {
   echo "[release] D3_RELEASE_TAG must be a 12-character lowercase git SHA" >&2
@@ -80,6 +81,12 @@ on_signal() {
 trap cleanup EXIT
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
+
+check_pending() {
+  (( ROLLBACK_MODE == 1 )) && return 0
+  [[ -z "$PENDING_SIGNAL" ]] || return 130
+  return 0
+}
 
 validate_scalar() {
   local value="$1"
@@ -140,6 +147,7 @@ load_manifest() {
     esac
   done < "$file"
   [[ "$header_seen" -eq 1 && "${#IMAGE_NAMES[@]}" -gt 0 ]] || { log "manifest has no images" >&2; return 1; }
+  [[ "${#PROBE_URLS[@]}" -gt 0 ]] || { log "manifest has no release probes" >&2; return 1; }
 }
 
 pull_and_retag() {
@@ -158,16 +166,19 @@ pull_and_retag() {
       sleep "$((PULL_RETRY_DELAY * attempt))"
       attempt=$((attempt + 1))
     done
+    check_pending || return 130
     "$DOCKER_BIN" tag "$ref" "$local_ref" || {
       log "retag failed for ${ref}; compose will not run" >&2
       return 1
     }
+    check_pending || return 130
   done
   return 0
 }
 
 compose_release() {
   local tag="$1" env_tmp="${STAGING_PREFIX}.env"
+  check_pending || return 130
   printf 'D3_RELEASE_TAG=%s\n' "$tag" > "$env_tmp" || return 1
   mv -f -- "$env_tmp" "$ENV_FILE" || return 1
   local compose_args=(compose)
@@ -177,17 +188,24 @@ compose_release() {
     compose_args+=(--env-file "$DEPLOY_DIR/.env")
   fi
   compose_args+=(--env-file "$ENV_FILE" up -d)
-  (cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}")
+  local compose_rc=0
+  (cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
+  check_pending || return 130
+  return "$compose_rc"
 }
 
 probe_release() {
   local i attempt code
   (( ${#PROBE_URLS[@]} == 0 )) && { log "no release probes declared"; return 0; }
+  check_pending || return 130
   sleep "$HEALTHCHECK_WARMUP"
+  check_pending || return 130
   for ((i = 0; i < ${#PROBE_URLS[@]}; i++)); do
     attempt=1
     while (( attempt <= HEALTHCHECK_RETRIES )); do
+      check_pending || return 130
       code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' --max-time "$HEALTHCHECK_TIMEOUT" "${PROBE_URLS[$i]}" 2>/dev/null || true)"
+      check_pending || return 130
       if [[ "$code" == "${PROBE_STATUS[$i]}" ]]; then break; fi
       log "probe ${PROBE_URLS[$i]} got ${code}, want ${PROBE_STATUS[$i]} (${attempt}/${HEALTHCHECK_RETRIES})"
       if (( attempt == HEALTHCHECK_RETRIES )); then return 1; fi
@@ -217,6 +235,7 @@ promote() {
 deploy_group() {
   local sha="$1" manifest="$2"
   load_manifest "$manifest" || return 1
+  check_pending || return 130
   pull_and_retag "$sha" || return 1
   compose_release "$sha" || return 1
 }
@@ -251,7 +270,10 @@ do_release() {
   if (( current_rc != 0 )) || [[ -n "$PENDING_SIGNAL" ]]; then
     log "new release failed before health gate"
   else
-    if probe_release && [[ -z "$PENDING_SIGNAL" ]]; then
+    if probe_release && check_pending; then
+      # Ignore a second signal for the short canonical commit: once promotion
+      # starts, both SHA and manifest move as one protected release decision.
+      trap ':' INT TERM
       promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" || return 1
       log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
       return 0
@@ -264,6 +286,7 @@ do_release() {
     log "rolling back complete image group to ${previous_sha}"
     # Once rollback starts, a second signal must not interrupt the group
     # transition or leave the host on a half-staged release.
+    ROLLBACK_MODE=1
     trap ':' INT TERM
     deploy_group "$previous_sha" "$previous_manifest" || rollback_rc=$?
     if (( rollback_rc == 0 )); then

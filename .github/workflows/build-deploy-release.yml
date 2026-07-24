@@ -157,15 +157,18 @@ jobs:
           set -euo pipefail
           SSH_OPTS=( -i "$HOME/.ssh/id_deploy" -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=4 -o ConnectTimeout=20 )
-          release_nonce="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          [[ "$release_nonce" =~ ^[0-9]+-[0-9]+$ ]] || { echo "invalid GitHub run metadata" >&2; exit 2; }
-          remote_manifest="/tmp/d3-release-${release_nonce}.manifest"
-          remote_script="/tmp/d3-release-${release_nonce}.sh"
+          release_base="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$release_base" =~ ^[0-9]+-[0-9]+$ ]] || { echo "invalid GitHub run metadata" >&2; exit 2; }
           cleanup_local() {
             rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds"
           }
           trap cleanup_local EXIT
           deploy_once() {
+            local transport_attempt="$attempt"
+            local transport_nonce="${release_base}-${transport_attempt}"
+            [[ "$transport_nonce" =~ ^[0-9]+-[0-9]+-[0-9]+$ ]] || return 2
+            local remote_manifest="/tmp/d3-release-${transport_nonce}.manifest"
+            local remote_script="/tmp/d3-release-${transport_nonce}.sh"
             scp "${SSH_OPTS[@]}" .ci-templates/scripts/release_deploy.sh \
               "${SSH_USER}@${DEPLOY_HOST}:${remote_script}" || return 255
             scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.manifest" \
