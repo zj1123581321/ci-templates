@@ -141,8 +141,14 @@ if [ -n "$BUSY_LOCK_FILE" ]; then
   if [ ! -e "$BUSY_LOCK_FILE" ]; then
     log "WARN: busy lock file ${BUSY_LOCK_FILE} missing — service side may not hold locks yet; creating it, proceeding WITHOUT drain protection"
     mkdir -p "$(dirname "$BUSY_LOCK_FILE")"
+    : >> "$BUSY_LOCK_FILE"   # append-open 的空操作：绝不 truncate，只是把文件创建出来
   fi
-  exec 8>>"$BUSY_LOCK_FILE"   # append-open：绝不 truncate，锁在 inode 上
+  # 只读打开：服务侧(容器内进程)创建的锁文件通常属主是容器内用户/root、权限较窄
+  # (如 0644),宿主上跑部署脚本的用户往往只有读权限、没有写权限。flock(2) 的互斥
+  # 语义作用在文件的 inode 上,不要求持有该锁的 fd 具备写权限——只读 fd 一样能申请
+  # LOCK_EX/LOCK_SH。这里改成只读打开以兼容"部署用户对锁文件只读"的真实场景，
+  # 语义与之前的 append-open 完全一致，只是不再要求写权限。
+  exec 8<"$BUSY_LOCK_FILE"
   if ! flock -w "$BUSY_LOCK_TIMEOUT" -x 8; then
     log "service busy: busy lock not acquired within ${BUSY_LOCK_TIMEOUT}s — DEFERRED, old container kept"
     exit 3

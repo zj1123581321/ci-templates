@@ -277,6 +277,23 @@ def test_busy_lock_free_deploys_normally(tmp_path):
     assert "compose up -d" in log
 
 
+def test_busy_lock_readonly_file_still_deploys(tmp_path):
+    """锁文件只读(部署用户无写权限,真实 bootstrap 场景:容器内进程创建,0444/0644)
+    → flock(2) 的互斥语义作用在 inode 上,不要求 fd 有写权限,只读打开一样能拿到
+    排他锁,部署应正常进行,不能因为 Permission denied 被判死。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    os.chmod(lock_file, 0o444)
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert "compose up -d" in log
+
+
 def test_busy_lock_held_defers_untouched(tmp_path):
     """忙锁被服务侧共享锁占住,超预算仍未空闲 → rc=3,容器/last_good 完全不动。"""
     mock_dir = tmp_path / "bin"
