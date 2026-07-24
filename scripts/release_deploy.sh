@@ -26,6 +26,8 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
 HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"
+REMOTE_SCRIPT_PATH="${RELEASE_TEMP_SCRIPT:-}"
+REMOTE_MANIFEST_PATH="$RELEASE_MANIFEST"
 
 GOOD_SHA_FILE="$STATE_DIR/last_good_sha"
 GOOD_MANIFEST_FILE="$STATE_DIR/last_good_manifest"
@@ -33,6 +35,7 @@ GOOD_RELEASE_FILE="$STATE_DIR/last_good_release"
 ENV_FILE="$DEPLOY_DIR/.d3-release.env"
 LOCK_FD=9
 STAGING_PREFIX="$STATE_DIR/.release-${D3_RELEASE_TAG}-$$"
+PENDING_SIGNAL=""
 
 [[ "$D3_RELEASE_TAG" =~ ^[0-9a-f]{12}$ ]] || {
   echo "[release] D3_RELEASE_TAG must be a 12-character lowercase git SHA" >&2
@@ -57,13 +60,26 @@ die() { log "ERROR: $*" >&2; return 1; }
 cleanup() {
   local rc=$?
   rm -f -- "${STAGING_PREFIX}.manifest" "${STAGING_PREFIX}.env" "${STAGING_PREFIX}.sha" "${STAGING_PREFIX}.release" "${STAGING_PREFIX}.previous" 2>/dev/null || true
+  # These are exact per-run paths supplied by the workflow; never glob /tmp.
+  case "$REMOTE_SCRIPT_PATH" in
+    /tmp/d3-release-[0-9]*-[0-9]*.sh) rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true ;;
+  esac
+  case "$REMOTE_MANIFEST_PATH" in
+    /tmp/d3-release-[0-9]*-[0-9]*.manifest) rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true ;;
+  esac
   if [[ -n "${LOCK_HELD:-}" ]]; then
     flock -u 9 2>/dev/null || true
   fi
   trap - EXIT INT TERM
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+  PENDING_SIGNAL="$1"
+  log "received ${1}; will finish current command and rollback without promotion"
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 
 validate_scalar() {
   local value="$1"
@@ -154,7 +170,14 @@ compose_release() {
   local tag="$1" env_tmp="${STAGING_PREFIX}.env"
   printf 'D3_RELEASE_TAG=%s\n' "$tag" > "$env_tmp" || return 1
   mv -f -- "$env_tmp" "$ENV_FILE" || return 1
-  (cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose --env-file "$ENV_FILE" up -d)
+  local compose_args=(compose)
+  # Compose does not load the project .env when --env-file is supplied.  Keep
+  # the caller's variables and overlay only D3_RELEASE_TAG afterwards.
+  if [[ -f "$DEPLOY_DIR/.env" ]]; then
+    compose_args+=(--env-file "$DEPLOY_DIR/.env")
+  fi
+  compose_args+=(--env-file "$ENV_FILE" up -d)
+  (cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}")
 }
 
 probe_release() {
@@ -201,6 +224,7 @@ deploy_group() {
 do_release() {
   local previous_sha="" previous_manifest="" current_rc=0 rollback_rc=0 first_line=1 line
   mkdir -p "$STATE_DIR" || return 1
+  [[ -z "$PENDING_SIGNAL" ]] || return 130
   if [[ -f "$GOOD_RELEASE_FILE" ]]; then
     previous_manifest="${STAGING_PREFIX}.previous"
     : > "$previous_manifest" || return 1
@@ -224,10 +248,10 @@ do_release() {
   fi
 
   deploy_group "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" || current_rc=$?
-  if (( current_rc != 0 )); then
+  if (( current_rc != 0 )) || [[ -n "$PENDING_SIGNAL" ]]; then
     log "new release failed before health gate"
   else
-    if probe_release; then
+    if probe_release && [[ -z "$PENDING_SIGNAL" ]]; then
       promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" || return 1
       log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
       return 0
@@ -238,6 +262,9 @@ do_release() {
 
   if [[ -n "$previous_sha" && -n "$previous_manifest" && -f "$previous_manifest" && "$previous_sha" != "$D3_RELEASE_TAG" ]]; then
     log "rolling back complete image group to ${previous_sha}"
+    # Once rollback starts, a second signal must not interrupt the group
+    # transition or leave the host on a half-staged release.
+    trap ':' INT TERM
     deploy_group "$previous_sha" "$previous_manifest" || rollback_rc=$?
     if (( rollback_rc == 0 )); then
       if probe_release; then
@@ -252,6 +279,7 @@ do_release() {
   else
     log "no previous good release available; refusing pseudo-rollback" >&2
   fi
+  [[ -n "$PENDING_SIGNAL" ]] && return 130
   return 1
 }
 

@@ -130,6 +130,8 @@ def normalize(images_raw: object, probes_raw: object) -> tuple[list[dict[str, st
         probes_raw = []
     if not isinstance(probes_raw, list):
         raise ValidationError("probes_json must be an array")
+    if not probes_raw:
+        raise ValidationError("probes_json must contain at least one release probe")
     probes = [_validate_probe(item, i) for i, item in enumerate(probes_raw)]
 
     # (alias, context, dockerfile, canonical image, all published names)

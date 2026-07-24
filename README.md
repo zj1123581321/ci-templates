@@ -33,7 +33,8 @@ tests/                  # pytest（schema + 部署逻辑 + workflow 契约）
 `build-deploy-release.yml`。`images_json` 是严格 JSON 数组，每项至少包含
 `image_name`、`build_context`、`dockerfile`；可选 `build_alias` 让 worker 别名共享一次
 构建（同一 alias 的 context 和 Dockerfile 必须一致）。未知字段、重复 image 名、控制字符、
-绝对路径和 `..` 路径都会在构建前拒绝。`probes_json` 是严格 JSON 数组，例如：
+绝对路径和 `..` 路径都会在构建前拒绝。`probes_json` 是必填的严格 JSON 数组；生产发布
+至少配置 frontend 入口和 backend API 两个探针，例如：
 
 ```json
 [{"url":"http://localhost:8080/","expect_status":200},

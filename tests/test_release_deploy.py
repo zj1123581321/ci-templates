@@ -1,8 +1,10 @@
 """TDD tests for atomic multi-image release deployment on the SSH host."""
 
 import os
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +91,19 @@ def test_group_deploy_retags_sha_and_compose_once(tmp_path):
     assert (Path(env["STATE_DIR"]) / "last_good_manifest").exists()
 
 
+def test_compose_preserves_existing_dotenv_and_overlays_release_tag(tmp_path):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / ".env").write_text("COMPOSE_PROJECT_NAME=existing\n")
+    result = run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = (
+        f"compose --env-file {deploy / '.env'} --env-file {deploy / '.d3-release.env'} up -d"
+    )
+    assert expected in log.read_text()
+    assert (deploy / ".env").read_text() == "COMPOSE_PROJECT_NAME=existing\n"
+
+
 def test_probe_failure_rolls_back_entire_group_and_preserves_good(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0
@@ -160,3 +175,64 @@ exit 0
     assert result.returncode != 0
     assert (state / "last_good_release").read_text() == before_release
     assert (state / "last_good_sha").read_text().strip() == "abc123456789"
+
+
+def test_term_during_new_compose_rolls_back_and_releases_lock(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    state = Path(env["STATE_DIR"])
+    before = (state / "last_good_release").read_text()
+    log.write_text("")
+    marker = tmp_path / "compose.done"
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ]; then sleep 0.25; touch "{marker}"; fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 3
+    while time.time() < deadline and "compose" not in log.read_text():
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=5)
+    assert proc.returncode != 0, stdout + stderr
+    lines = log.read_text().splitlines()
+    assert sum(line.startswith("compose ") for line in lines) >= 2
+    assert marker.exists(), "rollback compose must finish despite TERM"
+    assert (state / "last_good_release").read_text() == before
+    assert not list(state.glob(".release-*.release"))
+    # The lock is not leaked by the signal handler.
+    assert run(env).returncode == 0
+
+
+def test_term_during_rollback_is_ignored_until_group_finishes(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    marker = tmp_path / "rollback.done"
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ]; then
+  n=$(grep -c '^compose ' "{log}")
+  if [ "$n" -ge 2 ]; then sleep 0.25; touch "{marker}"; fi
+fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    mock_curl(Path(env["CURL_BIN"]), "500")
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 3
+    while time.time() < deadline and log.read_text().count("compose ") < 2:
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=5)
+    assert proc.returncode != 0, stdout + stderr
+    assert marker.exists(), "TERM must not interrupt rollback compose"
+    assert (Path(env["STATE_DIR"]) / "last_good_sha").read_text().strip() == "abc123456789"
