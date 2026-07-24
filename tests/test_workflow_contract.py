@@ -93,3 +93,58 @@ def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "[zlxlabs·CI]" in text
     assert "f\"🔴 {title_prefix} P0 部署失败" in text
+
+
+# --- busy-lock gate: inputs 透传 + rc=3 deferred 分流 + 双卡通知 --------------
+
+def test_busy_lock_inputs_declared_with_safe_defaults():
+    raw, trigger = _load()
+    inputs = trigger["workflow_call"]["inputs"]
+
+    assert "busy_lock_file" in inputs
+    assert inputs["busy_lock_file"].get("default") == ""
+    assert inputs["busy_lock_file"].get("required") is not True
+
+    assert "busy_lock_timeout" in inputs
+    assert inputs["busy_lock_timeout"].get("default") == "600"
+
+
+def test_busy_lock_env_is_passed_through_to_deploy_step():
+    text = WORKFLOW.read_text()
+    assert "BUSY_LOCK_FILE" in text
+    assert "BUSY_LOCK_TIMEOUT" in text
+    assert "inputs.busy_lock_file" in text
+    assert "inputs.busy_lock_timeout" in text
+
+
+def test_deferred_exit_code_writes_output_before_nonzero_exit():
+    text = WORKFLOW.read_text()
+    assert "deferred=true" in text
+    assert "GITHUB_OUTPUT" in text
+    # rc=3 判断必须先于笼统的 "!= 255" 判断,否则 deferred 会被误判为
+    # "已按探针门自动回滚" 报错退出,语义就错了。
+    idx_rc3 = text.index('"$rc" -eq 3')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    assert idx_rc3 < idx_rc_ne_255, "rc=3 分支必须在 != 255 判断之前"
+
+
+def test_red_card_step_skips_when_deferred():
+    text = WORKFLOW.read_text()
+    assert "deferred != 'true'" in text
+
+
+def test_yellow_card_step_exists_for_deferred_without_at_all():
+    text = WORKFLOW.read_text()
+    assert "deferred == 'true'" in text
+    assert "部署延期" in text
+
+    # 定位黄卡那一段(从"部署延期"关键词往后切),只在这一段里断言不含 <at id=all>;
+    # 红卡那段仍然应该含 <at id=all>,不能用"全文不含"这种粗暴断言。
+    idx = text.index("部署延期")
+    yellow_section = text[idx:]
+    assert "<at id=all>" not in yellow_section
+
+    red_idx = text.index("Feishu 部署失败卡")
+    # 红卡段落(该 step 起,到黄卡关键词出现前)仍然要 @全员
+    red_section = text[red_idx:idx]
+    assert "<at id=all>" in red_section

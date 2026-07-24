@@ -66,6 +66,15 @@ on:
         required: false
         default: "10"
         type: string
+      busy_lock_file:
+        description: "opt-in deploy gate: path to a service-held flock busy lock (e.g. <deploy_dir>/.deploy-state/busy.lock). Empty (default) disables the gate — behavior unchanged."
+        required: false
+        default: ""
+        type: string
+      busy_lock_timeout:
+        required: false
+        default: "600"
+        type: string
       ci_templates_ref:
         description: "Ref of ci-templates to fetch the deploy scripts from"
         required: false
@@ -148,6 +157,7 @@ jobs:
           chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy over SSH (flock + health probe + auto-rollback)
+        id: deploy
         env:
           ACR_REGISTRY: ${{ inputs.acr_registry }}
           ACR_NAMESPACE: ${{ inputs.acr_namespace }}
@@ -161,6 +171,8 @@ jobs:
           HEALTHCHECK_RETRIES: ${{ inputs.healthcheck_retries }}
           HEALTHCHECK_INTERVAL: ${{ inputs.healthcheck_interval }}
           HEALTHCHECK_WARMUP: ${{ inputs.healthcheck_warmup }}
+          BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
+          BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
         run: |
           ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
           # keepalive 防 tailnet 上偶发的 `Connection reset ...:22`(canary 遇过,50 服务规模会常遇):
@@ -173,6 +185,8 @@ jobs:
           #   255 = SSH/scp 传输层失败(Connection reset / timeout)→ 瞬时,安全重试
           #   1   = pull_and_deploy.sh 主动失败(探针挂,且已在 host 端自动回滚)
           #         → 真实坏部署,绝不重试(否则重拉/重部/重滚 3 遍,搅乱生产)
+          #   3   = deferred:busy-lock 门禁(opt-in)超时未等到,服务忙,旧容器保留
+          #         → 不是故障,不重试;写 deferred=true 分流去黄卡,等空闲手动 re-run
           # scp 只是拷个脚本文件(无副作用),失败一律归到 255 当瞬时重试;
           # ssh 透传远端脚本的退出码,1 与 255 在此被区分对待。
           deploy_once() {
@@ -187,6 +201,8 @@ jobs:
                HEALTHCHECK_RETRIES='${HEALTHCHECK_RETRIES}' \
                HEALTHCHECK_INTERVAL='${HEALTHCHECK_INTERVAL}' \
                HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
+               BUSY_LOCK_FILE='${BUSY_LOCK_FILE}' \
+               BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
                bash /tmp/pull_and_deploy.sh"
           }
 
@@ -196,6 +212,14 @@ jobs:
             if [ "$rc" -eq 0 ]; then
               echo "::notice::deploy ok (attempt ${attempt}/${max_attempts})"
               break
+            fi
+            if [ "$rc" -eq 3 ]; then
+              # deferred:busy-lock 门禁(opt-in)超时未等到,服务忙,旧容器保留。
+              # 顺序很重要:必须先于下面 "!= 255" 的判断拦截,否则会被误判为
+              # "已按探针门自动回滚" 报错退出,语义就错了(那是给探针失败用的)。
+              echo "deferred=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle."
+              exit 3
             fi
             if [ "$rc" -ne 255 ]; then
               # 脚本主动失败(已回滚)—— 真实问题,立即上报,不重试
@@ -218,7 +242,7 @@ jobs:
       # 凭据 = 调用方服务仓的 repo 变量 vars.FEISHU_CI_WEBHOOK(关键词模式,无 secret);
       # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
-        if: failure()
+        if: failure() && steps.deploy.outputs.deferred != 'true'
         continue-on-error: true
         env:
           FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
@@ -257,6 +281,61 @@ jobs:
                       {"tag": "div", "text": {"tag": "lark_md", "content": body}},
                       {"tag": "action", "actions": [
                           {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
+                           "type": "primary", "url": run_url},
+                      ]},
+                  ],
+              },
+          }
+          req = urllib.request.Request(
+              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+          except Exception as e:
+              print("feishu notify failed (swallowed):", e)
+          PY
+
+      # deferred(rc=3):busy-lock 门禁(opt-in)超时未等到,服务忙,不是故障。
+      # job 仍标红(诚实反映"新 SHA 未上线"),但通知分流成黄卡:不 @全员,
+      # 语义是"正常延期,构建已在库,空闲后点按钮 re-run"——与红卡的"真实故障"分开。
+      - name: Feishu 部署延期卡 (deferred, fail-open)
+        if: failure() && steps.deploy.outputs.deferred == 'true'
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          SVC:     ${{ inputs.image_name }}
+          HOST:    ${{ inputs.host }}
+          REPO:    ${{ github.repository }}
+          SHA:     ${{ steps.sha.outputs.git_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          svc     = os.environ.get("SVC", "") or "?"
+          host    = os.environ.get("HOST", "") or "?"
+          repo    = os.environ["REPO"]
+          sha     = os.environ.get("SHA", "") or "?"
+          run_url = os.environ["RUN_URL"]
+          # 黄卡:不 @全员——这是正常延期,不是故障,不该打扰全群。
+          body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
+                  f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
+                  f"服务忙(长任务进行中),本次**部署延期,未替换**——旧版本继续运行,生产不受影响。\n"
+                  f"镜像 `{sha}` 已构建并推送 ACR,无需重新 build;空闲后点按钮 **重跑部署**即可上线。")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"template": "yellow",
+                             "title": {"tag": "plain_text", "content": f"⏸️ {title_prefix} 部署延期 · {svc}"}},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "重跑部署"},
                            "type": "primary", "url": run_url},
                       ]},
                   ],
