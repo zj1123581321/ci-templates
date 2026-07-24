@@ -26,6 +26,8 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
 HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"
+BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"
+BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 REMOTE_SCRIPT_PATH="${RELEASE_TEMP_SCRIPT:-}"
 REMOTE_MANIFEST_PATH="$RELEASE_MANIFEST"
 
@@ -71,6 +73,9 @@ cleanup() {
   if [[ -n "${LOCK_HELD:-}" ]]; then
     flock -u 9 2>/dev/null || true
   fi
+  if [[ -n "${BUSY_LOCK_HELD:-}" ]]; then
+    flock -u 8 2>/dev/null || true
+  fi
   trap - EXIT INT TERM
   exit "$rc"
 }
@@ -87,6 +92,8 @@ check_pending() {
   [[ -z "$PENDING_SIGNAL" ]] || return 130
   return 0
 }
+
+is_positive_integer() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 
 validate_scalar() {
   local value="$1"
@@ -109,11 +116,12 @@ IMAGE_NAMES=()
 IMAGE_REFS=()
 PROBE_URLS=()
 PROBE_STATUS=()
+declare -A SEEN_IMAGE_NAMES=()
 
 load_manifest() {
   local file="$1" line kind a b
   [[ -f "$file" ]] || { log "manifest not found: $file" >&2; return 1; }
-  IMAGE_NAMES=(); IMAGE_REFS=(); PROBE_URLS=(); PROBE_STATUS=()
+  IMAGE_NAMES=(); IMAGE_REFS=(); PROBE_URLS=(); PROBE_STATUS=(); SEEN_IMAGE_NAMES=()
   local header_seen=0
   while IFS=$'\t' read -r kind a b; do
     [[ -z "$kind" ]] && continue
@@ -127,14 +135,13 @@ load_manifest() {
         validate_scalar "$a" || { log "unsafe image name in manifest" >&2; return 1; }
         validate_scalar "$b" || { log "unsafe image ref in manifest" >&2; return 1; }
         [[ "$a" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] || { log "invalid image name: $a" >&2; return 1; }
+        [[ -z "${SEEN_IMAGE_NAMES[$a]+seen}" ]] || { log "duplicate image name: $a" >&2; return 1; }
+        SEEN_IMAGE_NAMES["$a"]=1
         [[ "$b" != *$'\t'* ]] || { log "image ref contains a tab" >&2; return 1; }
-        [[ "$b" =~ ^[A-Za-z0-9._:/-]+$ ]] || { log "invalid image ref: $b" >&2; return 1; }
+        [[ "$b" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] || { log "manifest image ref must be a bare image name: $b" >&2; return 1; }
+        [[ "$a" == "$b" ]] || { log "manifest image name/ref mismatch: $a vs $b" >&2; return 1; }
         IMAGE_NAMES+=("$a")
-        if [[ "$b" == */* ]]; then
-          IMAGE_REFS+=("$b")
-        else
-          IMAGE_REFS+=("$ACR_REGISTRY/$ACR_NAMESPACE/$b")
-        fi
+        IMAGE_REFS+=("$ACR_REGISTRY/$ACR_NAMESPACE/$b")
         ;;
       probe)
         validate_scalar "$a" || { log "unsafe probe URL" >&2; return 1; }
@@ -161,6 +168,10 @@ pull_and_retag() {
       log "pull ${ref} failed (${attempt}/${PULL_RETRIES})"
       check_pending || return 130
       if (( attempt == PULL_RETRIES )); then
+        if "$DOCKER_BIN" image inspect "$ref" >/dev/null 2>&1; then
+          log "registry unreachable but ${ref} already local — proceeding"
+          break
+        fi
         log "pull failed; compose will not run" >&2
         return 1
       fi
@@ -188,7 +199,25 @@ compose_release() {
   if [[ -f "$DEPLOY_DIR/.env" ]]; then
     compose_args+=(--env-file "$DEPLOY_DIR/.env")
   fi
-  compose_args+=(--env-file "$ENV_FILE" up -d)
+  compose_args+=(--env-file "$ENV_FILE")
+  local rendered_images config_rc=0 image_ref found line
+  rendered_images="$("$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
+  if (( config_rc != 0 )); then
+    log "compose config --images failed; compose up will not run" >&2
+    return 1
+  fi
+  for image_name in "${IMAGE_NAMES[@]}"; do
+    image_ref="${image_name}:${tag}"
+    found=0
+    while IFS= read -r line; do
+      if [[ "$line" == "$image_ref" ]]; then found=1; break; fi
+    done <<< "$rendered_images"
+    if (( found == 0 )); then
+      log "compose identity gate missing ${image_ref}; compose up will not run" >&2
+      return 1
+    fi
+  done
+  compose_args+=(up -d)
   local compose_rc=0
   (cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
   check_pending || return 130
@@ -309,6 +338,53 @@ do_release() {
 
 mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
 exec 9>"$HOST_LOCK"
-flock 9 || exit 1
+if [[ -n "$BUSY_LOCK_FILE" ]]; then
+  if ! is_positive_integer "$BUSY_LOCK_TIMEOUT"; then
+    log "BUSY_LOCK_TIMEOUT must be a positive integer, got: ${BUSY_LOCK_TIMEOUT}" >&2
+    exit 1
+  fi
+  if [[ ! -e "$BUSY_LOCK_FILE" ]]; then
+    log "WARN: busy lock file ${BUSY_LOCK_FILE} missing; creating it" >&2
+    mkdir -p "$(dirname "$BUSY_LOCK_FILE")" || exit 1
+    : >> "$BUSY_LOCK_FILE" || exit 1
+  fi
+  exec 8<"$BUSY_LOCK_FILE" || exit 1
+  BUSY_LOCK_HELD=1
+  _deadline=$((SECONDS + BUSY_LOCK_TIMEOUT))
+  while :; do
+    _remain=$(( _deadline - SECONDS ))
+    if [[ "$_remain" -le 0 ]]; then
+      log "service busy: deferred after ${BUSY_LOCK_TIMEOUT}s" >&2
+      exit 3
+    fi
+    _frc=0
+    flock -w "$_remain" -x 8 || _frc=$?
+    if [[ "$_frc" -eq 1 ]]; then
+      log "service busy: deferred after ${BUSY_LOCK_TIMEOUT}s" >&2
+      exit 3
+    elif [[ "$_frc" -ne 0 ]]; then
+      log "busy lock flock failed (rc=${_frc})" >&2
+      exit 1
+    fi
+    if flock -n 9; then
+      break
+    fi
+    # Never hold service admission while waiting for the host lock.
+    flock -u 8
+    _nap=$(( _deadline - SECONDS )); [[ "$_nap" -gt 5 ]] && _nap=5
+    [[ "$_nap" -gt 0 ]] && sleep "$_nap"
+  done
+  log "busy lock + host lock acquired"
+else
+  flock 9 || exit 1
+fi
 LOCK_HELD=1
 do_release
+rc=$?
+flock -u 9 2>/dev/null || true
+LOCK_HELD=""
+if [[ -n "$BUSY_LOCK_FILE" ]]; then
+  flock -u 8 2>/dev/null || true
+  BUSY_LOCK_HELD=""
+fi
+exit "$rc"

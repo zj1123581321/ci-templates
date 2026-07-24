@@ -41,6 +41,21 @@ tests/                  # pytest（schema + 部署逻辑 + workflow 契约）
  {"url":"http://localhost:8000/healthz","expect_status":200}]
 ```
 
+Compose 必须使用不可变发布变量（Docker Compose v2，`config --images` 需可用）；公共的
+nginx 等额外镜像可以继续存在：
+
+```yaml
+services:
+  transcribe-backend:
+    image: transcribe-backend:${D3_RELEASE_TAG:?D3_RELEASE_TAG is required}
+  transcribe-frontend:
+    image: transcribe-frontend:${D3_RELEASE_TAG:?D3_RELEASE_TAG is required}
+```
+
+`busy_lock_file` / `busy_lock_timeout` 是可选服务 admission 门（默认空路径关闭，兼容旧行为）。
+启用后远端按服务忙锁再主机锁的顺序进入整组切换；忙时返回 rc=3，caller 只发黄色延后卡，
+不会 SSH 重试或提升 last-good。
+
 构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本会在同一个 host `flock` 临界区内拉取并
 将每张镜像 retag 为 `<image_name>:<sha>`，写入统一的 `D3_RELEASE_TAG` compose 环境文件，
 然后只执行一次 `docker compose up -d`。全部探针通过后才原子提升

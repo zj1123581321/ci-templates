@@ -49,3 +49,18 @@ def test_release_transfer_paths_are_run_unique_and_failure_notify_is_fail_open()
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "transport_nonce" in text
     assert "${transport_attempt}" in text
+
+
+def test_release_busy_lock_and_compose_identity_contract():
+    raw, trigger = load()
+    assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""
+    assert trigger["workflow_call"]["inputs"]["busy_lock_timeout"]["default"] == "600"
+    text = WORKFLOW.read_text()
+    assert "BUSY_LOCK_FILE" in text and "BUSY_LOCK_TIMEOUT" in text
+    assert "push_alias_to_acr.sh" in text
+    assert "config" in (text + (WORKFLOW.parents[2] / "scripts" / "release_deploy.sh").read_text())
+    assert "images" in (text + (WORKFLOW.parents[2] / "scripts" / "release_deploy.sh").read_text())
+    assert "busy_deferred" in text
+    assert "FEISHU_CI_TITLE_PREFIX" in text
+    assert "--max-time 10" in text
+    assert "json.dumps" in text

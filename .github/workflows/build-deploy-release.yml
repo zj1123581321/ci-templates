@@ -37,6 +37,16 @@ on:
         required: false
         default: "zlx-personal"
         type: string
+      busy_lock_file:
+        description: "Optional service admission flock path; empty preserves release behavior"
+        required: false
+        default: ""
+        type: string
+      busy_lock_timeout:
+        description: "Busy-lock total wait budget in seconds"
+        required: false
+        default: "600"
+        type: string
       ci_templates_ref:
         description: "Ref of ci-templates to fetch the release scripts from"
         required: false
@@ -123,7 +133,8 @@ jobs:
               source="${ACR_REGISTRY}/${ACR_NAMESPACE}/${canonical}:${GIT_SHA}"
               target="${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${GIT_SHA}"
               docker tag "$source" "$target"
-              timeout --kill-after=15s 300s docker push "$target"
+              SOURCE_IMAGE="$source" TARGET_IMAGE="$target" \
+                DOCKER_BIN=docker bash .ci-templates/scripts/push_alias_to_acr.sh
             done
           done < "$RUNNER_TEMP/d3-release.builds"
 
@@ -145,6 +156,7 @@ jobs:
           chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy release atomically over SSH
+        id: deploy
         env:
           ACR_REGISTRY: ${{ inputs.acr_registry }}
           ACR_NAMESPACE: ${{ inputs.acr_namespace }}
@@ -153,6 +165,8 @@ jobs:
           SSH_USER: ${{ inputs.ssh_user }}
           DEPLOY_DIR: ${{ inputs.deploy_dir }}
           HOST_LOCK: /var/lock/fleet-deploy.lock
+          BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
+          BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
         run: |
           set -euo pipefail
           SSH_OPTS=( -i "$HOME/.ssh/id_deploy" -o ServerAliveInterval=15 \
@@ -175,9 +189,9 @@ jobs:
               "${SSH_USER}@${DEPLOY_HOST}:${remote_manifest}" || return 255
             # printf %q makes every input one shell word; no JSON or raw input
             # is ever concatenated into the remote command.
-            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
+            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
               "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$DEPLOY_DIR" \
-              "$HOST_LOCK" "$remote_manifest" "$remote_script" "$remote_script"
+              "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" "$remote_manifest" "$remote_script" "$remote_script"
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
           }
           attempt=1; max_attempts=3
@@ -191,6 +205,9 @@ jobs:
             # failure has already rolled back (or reported first-deploy failure)
             # and must not be replayed.
             if [[ "$rc" -ne 255 ]]; then
+              if [[ "$rc" -eq 3 ]]; then
+                echo "busy_deferred=true" >> "$GITHUB_OUTPUT"
+              fi
               echo "::error::release deploy failed (rc=${rc}); no transport retry"
               exit "$rc"
             fi
@@ -203,8 +220,8 @@ jobs:
             sleep 10
           done
 
-      - name: Feishu release failure card (P0, fail-open)
-        if: failure()
+      - name: Feishu release busy defer card (yellow, fail-open)
+        if: failure() && steps.deploy.outputs.busy_deferred == 'true'
         continue-on-error: true
         env:
           FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
@@ -213,7 +230,22 @@ jobs:
           set -u
           webhook="${FEISHU_CI_WEBHOOK:-}"
           [[ -n "$webhook" ]] || exit 0
-          title_prefix="${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}"
-          payload="{\"msg_type\":\"text\",\"content\":{\"text\":\"${title_prefix} D3 release failed\"}}"
-          curl -fsS -X POST -H 'Content-Type: application/json' \
-            --data-raw "$payload" "$webhook" >/dev/null || true
+          python3 - "$webhook" "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          import json, sys
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[2]} D3 release deferred: service busy"}}))
+          PY
+
+      - name: Feishu release failure card (P0, fail-open)
+        if: failure() && steps.deploy.outputs.busy_deferred != 'true'
+        continue-on-error: true
+        env:
+          FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+        run: |
+          set -u
+          webhook="${FEISHU_CI_WEBHOOK:-}"
+          [[ -n "$webhook" ]] || exit 0
+          python3 - "$webhook" "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          import json, sys
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[2]} D3 release failed"}}))
+          PY

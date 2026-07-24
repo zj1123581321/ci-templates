@@ -21,6 +21,11 @@ def mock_docker(path: Path, log: Path, *, compose_rc=0, fail_pull=False, fail_ta
         path,
         f'''#!/bin/bash
 echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit {1 if fail_pull else 0}; fi
 if [ "$1" = pull ] && {'true' if fail_pull else 'false'}; then exit 1; fi
 if [ "$1" = tag ] && {'true' if fail_tag else 'false'}; then exit 1; fi
 if [ "$1" = compose ]; then exit {compose_rc}; fi
@@ -36,8 +41,8 @@ def mock_curl(path: Path, status: str):
 def manifest(path: Path, sha="abc123456789"):
     path.write_text(
         "D3_RELEASE_MANIFEST=1\n"
-        "image\tfrontend\tregistry/ns/frontend\n"
-        "image\tbackend\tregistry/ns/backend\n"
+        "image\tfrontend\tfrontend\n"
+        "image\tbackend\tbackend\n"
         "probe\thttp://localhost/frontend\t200\n"
         "probe\thttp://localhost/api/health\t200\n"
     )
@@ -104,6 +109,46 @@ def test_compose_preserves_existing_dotenv_and_overlays_release_tag(tmp_path):
     assert (deploy / ".env").read_text() == "COMPOSE_PROJECT_NAME=existing\n"
 
 
+def test_compose_identity_gate_rejects_latest_and_preserves_last_good(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    before = (Path(env["STATE_DIR"]) / "last_good_release").read_text()
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:latest\\nbackend:latest\\n'
+  exit 0
+fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    result = run(env)
+    assert result.returncode != 0
+    assert "compose up" not in log.read_text()
+    assert (Path(env["STATE_DIR"]) / "last_good_release").read_text() == before
+
+
+def test_compose_identity_gate_allows_extra_public_images(tmp_path):
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\nnginx:1.27\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+fi
+exit 0
+''',
+    )
+    result = run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "compose --env-file" in log.read_text()
+
+
 def test_probe_failure_rolls_back_entire_group_and_preserves_good(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0
@@ -159,6 +204,123 @@ def test_remote_manifest_rejects_zero_probes_defense_in_depth(tmp_path):
     assert not log.exists() or "compose" not in log.read_text()
 
 
+def test_remote_manifest_rejects_duplicate_or_full_registry_ref(tmp_path):
+    env, log = base(tmp_path)
+    Path(env["RELEASE_MANIFEST"]).write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\tfrontend\tfrontend\n"
+        "image\tfrontend\tfrontend\n"
+        "probe\thttp://localhost/health\t200\n"
+    )
+    result = run(env)
+    assert result.returncode != 0
+    assert "compose" not in log.read_text() if log.exists() else True
+
+    Path(env["RELEASE_MANIFEST"]).write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\tfrontend\tregistry/ns/frontend\n"
+        "probe\thttp://localhost/health\t200\n"
+    )
+    result = run(env)
+    assert result.returncode != 0
+
+
+def test_pull_exhausted_exact_sha_local_fallback(tmp_path):
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = pull ]; then exit 1; fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+fi
+exit 0
+''',
+    )
+    env["PULL_RETRIES"] = "1"
+    env["PULL_RETRY_DELAY"] = "0"
+    result = run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "already local" in result.stdout
+
+
+def _lock_holder(path: Path, mode: str = "-x", seconds: str = "1"):
+    return subprocess.Popen(
+        ["bash", "-c", f'exec 8>"$1"; flock {mode} 8; sleep "$2"', "holder", str(path), seconds],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def test_busy_lock_timeout_defers_without_compose_or_last_good(tmp_path):
+    env, log = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+    holder = _lock_holder(busy, seconds="2")
+    time.sleep(0.05)
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="1")
+    result = run(env)
+    holder.wait(timeout=3)
+    assert result.returncode == 3
+    assert "deferred" in (result.stdout + result.stderr).lower()
+    assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
+    assert not log.exists() or "compose" not in log.read_text()
+
+
+def test_busy_lock_release_within_budget_allows_deploy(tmp_path):
+    env, log = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+    holder = _lock_holder(busy, seconds="0.2")
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="2")
+    result = run(env)
+    holder.wait(timeout=3)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "compose" in log.read_text()
+
+
+def test_busy_lock_missing_file_warns_and_creates(tmp_path):
+    env, _ = base(tmp_path)
+    busy = tmp_path / "missing" / "busy.lock"
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="2")
+    result = run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert busy.exists()
+    assert "WARN" in result.stderr
+
+
+def test_busy_lock_invalid_timeout_is_configuration_failure(tmp_path):
+    env, _ = base(tmp_path)
+    env.update(BUSY_LOCK_FILE=str(tmp_path / "busy.lock"), BUSY_LOCK_TIMEOUT="nope")
+    result = run(env)
+    assert result.returncode == 1
+
+
+def test_busy_gate_host_contention_releases_admission_fd(tmp_path):
+    env, _ = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+    host_holder = _lock_holder(Path(env["HOST_LOCK"]), seconds="2")
+    time.sleep(0.05)
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="1")
+    result = run(env)
+    host_holder.wait(timeout=3)
+    assert result.returncode == 3
+    probe = subprocess.run(["flock", "-n", str(busy), "-c", "true"])
+    assert probe.returncode == 0, "busy admission lock leaked while host was contended"
+
+
+def test_busy_shared_service_lock_defers_before_compose(tmp_path):
+    env, log = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+    holder = _lock_holder(busy, mode="-s", seconds="2")
+    time.sleep(0.05)
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="1")
+    result = run(env)
+    holder.wait(timeout=3)
+    assert result.returncode == 3
+    assert not log.exists() or "compose" not in log.read_text()
+
+
 def test_rollback_pull_failure_preserves_atomic_previous_release(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0
@@ -199,6 +361,10 @@ def test_term_during_new_compose_rolls_back_and_releases_lock(tmp_path):
         Path(env["DOCKER_BIN"]),
         f'''#!/bin/bash
 echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
 if [ "$1" = compose ]; then sleep 0.25; touch "{marker}"; fi
 exit 0
 ''',
@@ -231,6 +397,10 @@ def test_term_during_pull_does_not_start_new_compose(tmp_path):
         Path(env["DOCKER_BIN"]),
         f'''#!/bin/bash
 echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
 if [ "$1" = pull ]; then touch "{marker}"; sleep 0.3; fi
 exit 0
 ''',
