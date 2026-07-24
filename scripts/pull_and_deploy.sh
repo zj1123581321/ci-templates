@@ -187,7 +187,12 @@ if [ -n "$BUSY_LOCK_FILE" ]; then
       break            # 两把锁同时在手 → 替换窗口开始
     fi
     flock -u 8         # 整机锁被别的部署占着:立即放掉忙锁,admission 重新打开
-    sleep 5            # 稍后重试整对锁(预算内)
+    # 重试前的休眠要 clamp 到"剩余预算"和 5s 两者中较小值:固定 sleep 5 在剩余预算
+    # 不足 5 秒时(比如 BUSY_LOCK_TIMEOUT=2)会把总等待拖过用户配置的预算上限,
+    # clamp 之后循环顶部的预算耗尽判断才能准时生效,deferred 不会被这一觉睡过头。
+    _nap=$(( _deadline - SECONDS ))
+    if [ "$_nap" -gt 5 ]; then _nap=5; fi
+    if [ "$_nap" -gt 0 ]; then sleep "$_nap"; fi
   done
   log "busy lock + host deploy lock both acquired (admission closed until replace completes)"
 fi

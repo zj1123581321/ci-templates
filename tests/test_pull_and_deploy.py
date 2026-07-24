@@ -456,7 +456,9 @@ def test_host_lock_held_past_budget_defers(tmp_path):
         holder.wait()
 
     assert res.returncode == 3, res.stdout + res.stderr
-    assert elapsed < 10, f"must defer well before the 12s host-lock hold, took {elapsed:.1f}s"
+    # 2s 预算 + 重试循环里 clamp 后的等待,应该在 4.5s 内 deferred(留了余量,不是脆弱计时);
+    # 若整机锁重试的 sleep 没有 clamp 到剩余预算,固定 sleep 5s 会把这里拖到 5-7s,便会超阈值。
+    assert elapsed < 4.5, f"must defer within budget, not be dragged out by a fixed retry sleep, took elapsed={elapsed:.2f}s"
     docker_log_path = Path(env["DOCKER_LOG"])
     log = docker_log_path.read_text() if docker_log_path.exists() else ""
     assert "compose up -d" not in log
