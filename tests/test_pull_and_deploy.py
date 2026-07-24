@@ -386,3 +386,97 @@ def test_admission_closed_during_replace(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     log = Path(env["DOCKER_LOG"]).read_text()
     assert "sh_probe=closed" in log, log
+
+
+# --- P1 fix: don't hold one lock while waiting on the other ------------------
+# GitHub concurrency is repo-scoped, so cross-service mutual exclusion on the
+# same host relies entirely on HOST_LOCK. During the *waiting* phase, holding
+# the busy lock while blocked on HOST_LOCK keeps admission closed even though
+# no container replacement is happening yet — exactly what this gate is
+# supposed to protect against. At any point while waiting, at most one of the
+# two locks may be held: whichever one is currently being waited on.
+
+def test_host_lock_contention_keeps_admission_open(tmp_path):
+    """同主机另一服务占着整机锁时,等待阶段绝不能顺手攥着忙锁——admission 必须开着。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    env["BUSY_LOCK_TIMEOUT"] = "15"
+    host_lock = Path(env["HOST_LOCK"])
+
+    holder = subprocess.Popen(["flock", "-x", str(host_lock), "sleep", "2"])
+    results = {}
+
+    def worker():
+        results["res"] = _run(env)
+
+    try:
+        time.sleep(0.5)  # holder has grabbed the host lock by now
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(1.0)  # script should be past its first attempt: busy lock
+                          # already released, sleeping before the next retry
+        probe = subprocess.run(["flock", "-n", "-s", str(lock_file), "true"])
+        assert probe.returncode == 0, (
+            "admission must stay open while the script is only waiting on the host lock"
+        )
+        t.join(timeout=15)
+        assert not t.is_alive(), "deploy script did not finish within 15s"
+    finally:
+        holder.terminate()
+        holder.wait()
+
+    res = results["res"]
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "compose up -d" in Path(env["DOCKER_LOG"]).read_text()
+
+
+def test_host_lock_held_past_budget_defers(tmp_path):
+    """整机锁被占的时长超过忙锁预算 → 必须在预算内 deferred,不能被主机锁拖着死等。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    env["BUSY_LOCK_TIMEOUT"] = "2"
+    host_lock = Path(env["HOST_LOCK"])
+
+    holder = subprocess.Popen(["flock", "-x", str(host_lock), "sleep", "12"])
+    try:
+        time.sleep(0.5)  # holder has grabbed the host lock by now
+        start = time.monotonic()
+        res = _run(env)
+        elapsed = time.monotonic() - start
+    finally:
+        holder.terminate()
+        holder.wait()
+
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert elapsed < 10, f"must defer well before the 12s host-lock hold, took {elapsed:.1f}s"
+    docker_log_path = Path(env["DOCKER_LOG"])
+    log = docker_log_path.read_text() if docker_log_path.exists() else ""
+    assert "compose up -d" not in log
+    assert "compose up" not in log
+
+
+def test_invalid_busy_lock_timeout_fails_hard(tmp_path):
+    """BUSY_LOCK_TIMEOUT 不是正整数 → 必须是显式的配置错误(rc=1),不能被 bash 算术
+    悄悄当 0 处理后伪装成"服务忙"的 deferred(rc=3)——两者运维含义完全不同。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env["BUSY_LOCK_FILE"] = str(lock_file)
+    env["BUSY_LOCK_TIMEOUT"] = "abc"
+
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    docker_log_path = Path(env["DOCKER_LOG"])
+    log = docker_log_path.read_text() if docker_log_path.exists() else ""
+    assert "compose up" not in log
+    assert "BUSY_LOCK_TIMEOUT" in (res.stdout + res.stderr)

@@ -50,6 +50,10 @@ GOOD_TAG_FILE="${STATE_DIR}/last_good_tag"
 log()   { echo "[deploy] $*"; }
 event() { [ -n "$DEPLOY_EVENT_LOG" ] && echo "$1:${DEPLOY_ID}" >> "$DEPLOY_EVENT_LOG" || true; }
 
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
 # --- pull with retry + local fallback ----------------------------------------
 # 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
 # 不可变,本地已有的同 tag 镜像(回滚残留/预热)与远端逐字节一致 —— registry 单独挂
@@ -133,9 +137,23 @@ do_deploy() {
 # --- busy-lock deploy gate (opt-in; BUSY_LOCK_FILE empty = skip entirely) ----
 # 服务侧每个不可打断任务存续期间对这个文件持共享锁(LOCK_SH);这里在替换容器前
 # 申请排他锁(LOCK_EX) —— 拿到即证明"无进行中任务,且新任务进不来"。
-# 锁序固定:先忙锁(fd 8,服务级) 后 HOST_LOCK(fd 9,整机级)。不会死锁:每个服务
-# 的忙锁文件互不相同,HOST_LOCK 全局只有一把,顺序固定的两级锁不构成环。
+# 锁申请顺序固定:先忙锁(fd 8,服务级) 后 HOST_LOCK(fd 9,整机级)——每个服务的忙锁
+# 文件互不相同,HOST_LOCK 全局只有一把,顺序固定的两级锁不构成环,不会死锁。
+# 但"申请顺序固定"不等于"等待期间可以互相攥着":两把锁只应该在真正的替换窗口
+# (即将 compose up 之前)同时持有;在等待阶段,任何时刻最多只持有正在等的那一把,
+# 绝不允许"因为在等 HOST_LOCK,所以顺手一直攥着已经到手的忙锁"——那会让 admission
+# 在纯排队等待、尚未开始替换容器的时间里被误关,反而伤到这套门禁本该保护的对象。
+# 做法是一个循环:申请忙锁(带预算)→ 非阻塞探 HOST_LOCK → HOST_LOCK 被占就立即
+# 放掉忙锁、sleep 5s 后重试整对锁 → 总预算(BUSY_LOCK_TIMEOUT)耗尽仍未能同时拿到
+# 两把锁,则本次 deferred。
+mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
+exec 9>"$HOST_LOCK"
+
 if [ -n "$BUSY_LOCK_FILE" ]; then
+  if ! is_positive_integer "$BUSY_LOCK_TIMEOUT"; then
+    log "BUSY_LOCK_TIMEOUT must be a positive integer, got: ${BUSY_LOCK_TIMEOUT}"
+    exit 1
+  fi
   # pre-pull outside all locks: shrinks the admission-closed window to seconds
   pull_image "${ACR_IMAGE}:${GIT_SHA}"
   if [ ! -e "$BUSY_LOCK_FILE" ]; then
@@ -149,16 +167,36 @@ if [ -n "$BUSY_LOCK_FILE" ]; then
   # LOCK_EX/LOCK_SH。这里改成只读打开以兼容"部署用户对锁文件只读"的真实场景，
   # 语义与之前的 append-open 完全一致，只是不再要求写权限。
   exec 8<"$BUSY_LOCK_FILE"
-  if ! flock -w "$BUSY_LOCK_TIMEOUT" -x 8; then
-    log "service busy: busy lock not acquired within ${BUSY_LOCK_TIMEOUT}s — DEFERRED, old container kept"
-    exit 3
-  fi
-  log "busy lock acquired (admission closed until replace completes)"
+
+  _deadline=$(( SECONDS + BUSY_LOCK_TIMEOUT ))
+  while :; do
+    _remain=$(( _deadline - SECONDS ))
+    if [ "$_remain" -le 0 ]; then
+      log "service busy: host deploy lock busy through the whole ${BUSY_LOCK_TIMEOUT}s budget — DEFERRED, old container kept"
+      exit 3
+    fi
+    _frc=0; flock -w "$_remain" -x 8 || _frc=$?
+    if [ "$_frc" -eq 1 ]; then
+      log "service busy: busy lock not acquired within budget — DEFERRED, old container kept"
+      exit 3
+    elif [ "$_frc" -ne 0 ]; then
+      log "flock on busy lock failed with rc=${_frc} (not a lock timeout — config or host problem)"
+      exit 1
+    fi
+    if flock -n 9; then
+      break            # 两把锁同时在手 → 替换窗口开始
+    fi
+    flock -u 8         # 整机锁被别的部署占着:立即放掉忙锁,admission 重新打开
+    sleep 5            # 稍后重试整对锁(预算内)
+  done
+  log "busy lock + host deploy lock both acquired (admission closed until replace completes)"
 fi
 
-mkdir -p "$(dirname "$HOST_LOCK")" 2>/dev/null || true
-exec 9>"$HOST_LOCK"
-flock 9          # blocks until this host's deploy lock is free
+# opt-in 路径:fd 9 上面已经通过 flock -n 9 拿到锁了,这一行只是确认——同一进程对
+# 同一 fd 重复 flock 是空操作,立即成功返回,不会阻塞。
+# opt-out 路径:busy-lock if 块整体跳过,fd 9 尚未加锁,这一行就是原来的行为——
+# 阻塞直到这台主机的部署锁空闲。
+flock 9
 do_deploy
 rc=$?
 flock -u 9
